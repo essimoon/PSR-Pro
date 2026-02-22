@@ -2346,29 +2346,29 @@ tool_strip.pack_propagate(False)
 ctk.CTkLabel(tool_strip, text="TOOLS", font=("Segoe UI", 9, "bold"),
              text_color=C["muted"], width=54).pack(side="left", padx=(14,4))
 
-_TB = dict(height=30, corner_radius=5, font=("Segoe UI", 11), border_width=1, width=110)
+_TB = dict(height=30, corner_radius=5, font=("Segoe UI", 11), border_width=1, width=126)
 
-btn_pointer = ctk.CTkButton(tool_strip, text="🖱  Pointer",
+btn_pointer = ctk.CTkButton(tool_strip, text="🖱  Pointer (V)",
     fg_color=C["acc_dark"], border_color=C["accent"], hover_color=C["acc_dark"],
     command=lambda: set_tool("none"), **_TB)
 btn_pointer.pack(side="left", padx=3, pady=10)
 
-btn_highlight = ctk.CTkButton(tool_strip, text="🔴  Highlight",
+btn_highlight = ctk.CTkButton(tool_strip, text="🔴  Highlight (U)",
     fg_color="transparent", border_color=C["border"], hover_color="#4a1010",
     command=lambda: set_tool("highlight"), **_TB)
 btn_highlight.pack(side="left", padx=3, pady=10)
 
-btn_redact = ctk.CTkButton(tool_strip, text="⬛  Redact",
+btn_redact = ctk.CTkButton(tool_strip, text="⬛  Redact (M)",
     fg_color="transparent", border_color=C["border"], hover_color="#1a1a1a",
     command=lambda: set_tool("redact"), **_TB)
 btn_redact.pack(side="left", padx=3, pady=10)
 
-btn_crop = ctk.CTkButton(tool_strip, text="✂  Crop",
+btn_crop = ctk.CTkButton(tool_strip, text="✂  Crop (C)",
     fg_color="transparent", border_color=C["border"], hover_color="#3a3010",
     command=lambda: set_tool("crop"), **_TB)
 btn_crop.pack(side="left", padx=3, pady=10)
 
-btn_draw = ctk.CTkButton(tool_strip, text="✏  Draw",
+btn_draw = ctk.CTkButton(tool_strip, text="✏  Draw (B)",
     fg_color="transparent", border_color=C["border"], hover_color="#1a2a1a",
     command=lambda: set_tool("draw"), **_TB)
 btn_draw.pack(side="left", padx=3, pady=10)
@@ -2470,9 +2470,39 @@ def _on_root_key(event):
             card.delete_selected()
             return "break"
 
+
+def _on_tool_hotkey(event):
+    focus = root.focus_get()
+    if focus:
+        wclass = focus.winfo_class()
+        if wclass in ('Text', 'Entry', 'TEntry', 'Spinbox', 'TSpinbox'):
+            return
+    _TOOL_KEYS = {'v': 'none', 'u': 'highlight', 'm': 'redact', 'c': 'crop', 'b': 'draw'}
+    tool = _TOOL_KEYS.get(event.char.lower())
+    if tool:
+        set_tool(tool)
+        return "break"
+
+
+def _on_undo(event=None):
+    focus = root.focus_get()
+    if focus:
+        wclass = focus.winfo_class()
+        if wclass in ('Text', 'Entry', 'TEntry', 'Spinbox', 'TSpinbox'):
+            return
+    card = active_card_ref[0]
+    if card is not None and not card.is_text_only:
+        card._undo()
+        return "break"
+
+
 root.bind("<Delete>",    _on_root_key)
 root.bind("<BackSpace>", _on_root_key)
 root.bind("<Control-v>", _handle_paste)
+root.bind("<Control-z>", _on_undo)
+for _hk in ('v', 'u', 'm', 'c', 'b'):
+    root.bind(f"<KeyPress-{_hk}>", _on_tool_hotkey)
+    root.bind(f"<KeyPress-{_hk.upper()}>", _on_tool_hotkey)
 
 
 # ══════════════════════════════════════ START ══════════════════════════════════════
