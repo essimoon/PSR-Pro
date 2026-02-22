@@ -7,6 +7,7 @@ Mouse-up screenshot capture · Per-step undo · Continue recording
 
 Dependencies:
     pip install customtkinter pillow mss pynput pygetwindow fpdf2
+    pip install tkinterdnd2          # optional: enables drag-and-drop
 """
 
 import copy, io, os, json, queue, subprocess, sys, threading, base64, webbrowser
@@ -15,7 +16,7 @@ from datetime import datetime
 import tkinter as tk
 from tkinter import filedialog, messagebox
 import customtkinter as ctk
-from PIL import Image, ImageTk, ImageDraw
+from PIL import Image, ImageTk, ImageDraw, ImageGrab
 import mss, mss.tools
 from pynput import mouse, keyboard
 from fpdf import FPDF
@@ -25,6 +26,12 @@ try:
     _HAS_GW = True
 except ImportError:
     _HAS_GW = False
+
+try:
+    from tkinterdnd2 import TkinterDnD
+    _HAS_DND = True
+except ImportError:
+    _HAS_DND = False
 
 
 # ══════════════════════════════════════ THEME ══════════════════════════════════════
@@ -493,6 +500,217 @@ def insert_custom_step(after_index=None):
     step_counter = len(log_data) + 1
     _renumber_and_rebuild(scroll_to=insert_pos)
     _set_status(f"✔  Custom step inserted at position {insert_pos + 1}", C["success"])
+
+
+# ══════════════════════════════════════ QUICK INSERT ══════════════════════════════════════
+
+_IMG_EXTS = {'.png', '.jpg', '.jpeg', '.bmp', '.webp', '.gif'}
+
+
+def _insert_step_image(src, insert_pos=None, desc=None):
+    """Create a step from a file path (str) or PIL Image. Returns the insert index."""
+    if not current_session:
+        return None
+    if insert_pos is None:
+        insert_pos = len(log_data)
+
+    fname = f"step_paste_{datetime.now().strftime('%H%M%S%f')}.png"
+    dst   = os.path.join(current_session, fname)
+
+    if isinstance(src, str):
+        Image.open(src).convert("RGB").save(dst, "PNG")
+        desc = desc or os.path.basename(src)
+    else:
+        src.convert("RGB").save(dst, "PNG")
+        desc = desc or "Pasted image"
+
+    _shift_step_data_up(insert_pos)
+    log_data.insert(insert_pos, {
+        "step":        insert_pos + 1,
+        "description": desc,
+        "screenshot":  fname,
+    })
+    step_objects[insert_pos] = []
+
+    global step_counter
+    step_counter = len(log_data) + 1
+    return insert_pos
+
+
+def _insert_step_text(text, insert_pos=None):
+    """Create a text-only step. Returns the insert index."""
+    if not current_session:
+        return None
+    if insert_pos is None:
+        insert_pos = len(log_data)
+
+    _shift_step_data_up(insert_pos)
+    log_data.insert(insert_pos, {
+        "step":        insert_pos + 1,
+        "description": text[:4000],
+        "screenshot":  None,
+    })
+    step_objects[insert_pos] = []
+
+    global step_counter
+    step_counter = len(log_data) + 1
+    return insert_pos
+
+
+# ══════════════════════════════════════ PASTE & DROP ══════════════════════════════════════
+
+def _active_insert_pos():
+    """Return the insert position after the currently active card, or end."""
+    card = active_card_ref[0]
+    if card is not None and card.index < len(log_data):
+        return card.index + 1
+    return len(log_data)
+
+
+def _handle_paste(event=None):
+    """Ctrl+V — create new step(s) from clipboard image or text."""
+    focus = root.focus_get()
+    if focus:
+        wclass = focus.winfo_class()
+        if wclass in ('Text', 'Entry', 'TEntry', 'Spinbox', 'TSpinbox'):
+            return
+
+    if not current_session:
+        _set_status("Start or open a recording to paste into", C["warn"])
+        return "break"
+
+    pos = _active_insert_pos()
+
+    try:
+        clip = ImageGrab.grabclipboard()
+        if clip is not None:
+            if isinstance(clip, Image.Image):
+                _insert_step_image(clip, pos)
+                _renumber_and_rebuild(scroll_to=pos)
+                _set_status(f"✔  Pasted image as step {pos + 1}", C["success"])
+                return "break"
+            if isinstance(clip, list):
+                count = 0
+                for p in clip:
+                    if isinstance(p, str) and os.path.splitext(p)[1].lower() in _IMG_EXTS:
+                        _insert_step_image(p, pos + count)
+                        count += 1
+                if count:
+                    _renumber_and_rebuild(scroll_to=pos)
+                    _set_status(f"✔  Pasted {count} image(s) starting at step {pos + 1}", C["success"])
+                    return "break"
+    except Exception:
+        pass
+
+    try:
+        text = root.clipboard_get()
+        if text and text.strip():
+            _insert_step_text(text.strip(), pos)
+            _renumber_and_rebuild(scroll_to=pos)
+            _set_status(f"✔  Pasted text as step {pos + 1}", C["success"])
+            return "break"
+    except Exception:
+        pass
+
+
+def _drop_insert_pos(x_root, y_root):
+    """Compute insertion index from screen coords using visible cards."""
+    if not step_cards:
+        return 0
+    if view_mode == "grid":
+        best, best_dist = 0, float("inf")
+        for i, card in enumerate(step_cards):
+            try:
+                wx = card.outer.winfo_rootx()
+                wy = card.outer.winfo_rooty()
+                ww = card.outer.winfo_width()
+                wh = card.outer.winfo_height()
+                dist = abs(y_root - (wy + wh // 2)) * 2 + abs(x_root - (wx + ww // 2))
+                if dist < best_dist:
+                    best_dist = dist
+                    best = i
+            except Exception:
+                pass
+        return best
+    for i, card in enumerate(step_cards):
+        try:
+            wy = card.outer.winfo_rooty()
+            wh = card.outer.winfo_height()
+            if y_root < wy + wh // 2:
+                return i
+        except Exception:
+            pass
+    return len(step_cards)
+
+
+def _handle_file_drop(raw_paths, x_root, y_root):
+    """Process file paths dropped onto the app."""
+    if not current_session:
+        _set_status("Start or open a recording to drop into", C["warn"])
+        return
+
+    try:
+        paths = root.tk.splitlist(raw_paths)
+    except Exception:
+        paths = raw_paths.split()
+
+    pos   = _drop_insert_pos(x_root, y_root)
+    count = 0
+
+    for fpath in paths:
+        fpath = fpath.strip()
+        if not os.path.isfile(fpath):
+            continue
+        ext = os.path.splitext(fpath)[1].lower()
+        if ext in _IMG_EXTS:
+            _insert_step_image(fpath, pos + count)
+            count += 1
+        elif ext in ('.txt', '.md', '.log'):
+            try:
+                with open(fpath, 'r', encoding='utf-8', errors='replace') as f:
+                    text = f.read(4000).strip()
+                if text:
+                    _insert_step_text(text, pos + count)
+                    count += 1
+            except Exception:
+                pass
+
+    if count:
+        _renumber_and_rebuild(scroll_to=pos)
+        _set_status(f"✔  Dropped {count} item(s) at step {pos + 1}", C["success"])
+    else:
+        _set_status("No supported files found in drop", C["muted"])
+
+
+def _setup_dnd():
+    """Register the cards panel as a drag-and-drop target (requires tkinterdnd2)."""
+    if not _HAS_DND:
+        return
+    try:
+        tkdnd_path = os.path.join(os.path.dirname(
+            __import__('tkinterdnd2').__file__), 'tkdnd')
+        root.tk.call('lappend', 'auto_path', tkdnd_path)
+        root.tk.eval('package require tkdnd')
+    except Exception:
+        return
+
+    target_w = right_frame._w
+
+    def _tcl_drop(*args):
+        raw = root.tk.getvar('::_psr_drop_data')
+        x   = root.winfo_pointerx()
+        y   = root.winfo_pointery()
+        root.after(0, lambda: _handle_file_drop(raw, x, y))
+
+    cmd = root.register(_tcl_drop)
+
+    try:
+        root.tk.call('tkdnd::drop_target', 'register', target_w, 'DND_Files')
+        root.tk.eval(
+            f'bind {target_w} <<Drop:DND_Files>> '
+            f'{{set ::_psr_drop_data %D; {cmd}}}')
+    except Exception as e:
+        print(f"[PSR] DnD setup failed: {e}")
 
 
 # ══════════════════════════════════════ DESC AUTO-SAVE ══════════════════════════════════════
@@ -1144,18 +1362,11 @@ class ListCard:
     def _load_thumb(self):
         if not current_session:
             return
-        entry    = log_data[self.index]
-        img_path = os.path.join(current_session, entry["screenshot"])
-        if not os.path.exists(img_path):
+        flat = _flatten_to_pil(self.index)
+        if flat is None:
             return
-        img = Image.open(img_path).convert("RGB")
-        cx1, cy1, cx2, cy2 = _get_crop(self.index, img.size)
-        cx1, cx2 = sorted([cx1, cx2]); cy1, cy2 = sorted([cy1, cy2])
-        cx1 = max(0, min(cx1, img.size[0])); cy1 = max(0, min(cy1, img.size[1]))
-        cx2 = max(cx1+1, min(cx2, img.size[0])); cy2 = max(cy1+1, min(cy2, img.size[1]))
-        cropped = img.crop((cx1, cy1, cx2, cy2))
-        cropped.thumbnail((LIST_THUMB_W, 68), Image.LANCZOS)
-        self._photo = ImageTk.PhotoImage(cropped)
+        flat.thumbnail((LIST_THUMB_W, 68), Image.LANCZOS)
+        self._photo = ImageTk.PhotoImage(flat)
         self._thumb_label.configure(image=self._photo)
 
     def _delete(self):
@@ -1247,18 +1458,11 @@ class GridCard:
     def _load_thumb(self):
         if not current_session:
             return
-        entry    = log_data[self.index]
-        img_path = os.path.join(current_session, entry["screenshot"])
-        if not os.path.exists(img_path):
+        flat = _flatten_to_pil(self.index)
+        if flat is None:
             return
-        img = Image.open(img_path).convert("RGB")
-        cx1, cy1, cx2, cy2 = _get_crop(self.index, img.size)
-        cx1, cx2 = sorted([cx1, cx2]); cy1, cy2 = sorted([cy1, cy2])
-        cx1 = max(0, min(cx1, img.size[0])); cy1 = max(0, min(cy1, img.size[1]))
-        cx2 = max(cx1+1, min(cx2, img.size[0])); cy2 = max(cy1+1, min(cy2, img.size[1]))
-        cropped = img.crop((cx1, cy1, cx2, cy2))
-        cropped.thumbnail((GRID_TILE_W-4, 150), Image.LANCZOS)
-        self._photo = ImageTk.PhotoImage(cropped)
+        flat.thumbnail((GRID_TILE_W-4, 150), Image.LANCZOS)
+        self._photo = ImageTk.PhotoImage(flat)
         self._thumb_label.configure(image=self._photo)
 
     def _delete(self):
@@ -2268,9 +2472,11 @@ def _on_root_key(event):
 
 root.bind("<Delete>",    _on_root_key)
 root.bind("<BackSpace>", _on_root_key)
+root.bind("<Control-v>", _handle_paste)
 
 
 # ══════════════════════════════════════ START ══════════════════════════════════════
 
 root.after(100, process_queue)
+root.after(300, _setup_dnd)
 root.mainloop()
