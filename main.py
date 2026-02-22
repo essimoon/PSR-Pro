@@ -2170,6 +2170,20 @@ def export_html():
         messagebox.showwarning("Nothing to export", "No steps to export."); return
     title       = _export_title()
     report_path = _export_filename("html")
+    total       = len(log_data)
+    gen_date    = datetime.now().strftime('%Y-%m-%d %H:%M')
+    gen_year    = datetime.now().year
+
+    # Pre-encode all images once (shared by both views)
+    step_images = []
+    for i, entry in enumerate(log_data):
+        flat = _flatten_to_pil(i)
+        if flat is not None:
+            buf = io.BytesIO()
+            flat.save(buf, "PNG")
+            step_images.append(base64.b64encode(buf.getvalue()).decode())
+        else:
+            step_images.append(None)
 
     try:
         with open(report_path, "w", encoding="utf-8") as f:
@@ -2179,45 +2193,196 @@ def export_html():
 <style>
 @import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;600&family=IBM+Plex+Sans:wght@300;400;600&display=swap');
 *,*::before,*::after{{box-sizing:border-box;margin:0;padding:0}}
-:root{{--bg:#0e0e0e;--surface:#181818;--border:#252525;--accent:#3d8ef0;--text:#e2e2e2;--muted:#666}}
+:root{{--bg:#0e0e0e;--surface:#141414;--border:#252525;--accent:#3d8ef0;--accent12:rgba(61,142,240,.12);
+       --text:#e2e2e2;--muted:#666;--radius:12px}}
+html,body{{height:100%}}
 body{{background:var(--bg);color:var(--text);font-family:'IBM Plex Sans',sans-serif;font-weight:300;
-     max-width:1020px;margin:0 auto;padding:60px 24px 90px}}
-header{{display:flex;align-items:flex-end;justify-content:space-between;
-        border-bottom:1px solid var(--border);padding-bottom:20px;margin-bottom:52px}}
-header h1{{font-family:'IBM Plex Mono',monospace;font-size:24px;font-weight:600;color:var(--accent)}}
-header p{{color:var(--muted);font-family:'IBM Plex Mono',monospace;font-size:12px;text-align:right;line-height:1.8}}
-.step{{background:var(--surface);border:1px solid var(--border);border-radius:10px;overflow:hidden;margin-bottom:28px}}
-.step-header{{display:flex;align-items:center;gap:14px;padding:14px 20px;border-bottom:1px solid var(--border)}}
-.step-num{{font-family:'IBM Plex Mono',monospace;font-size:10px;font-weight:600;color:var(--accent);
-          background:rgba(61,142,240,.12);padding:3px 10px;border-radius:4px;white-space:nowrap}}
-.step-desc{{font-size:14px;color:var(--text);line-height:1.55}}
-.step img{{display:block;width:100%;height:auto}}
-footer{{text-align:center;color:var(--muted);font-size:11px;font-family:'IBM Plex Mono',monospace;
-        margin-top:56px;padding-top:20px;border-top:1px solid var(--border)}}
+     display:flex;flex-direction:column;overflow:hidden}}
+
+/* ── top bar ── */
+.topbar{{display:flex;align-items:center;justify-content:space-between;
+         padding:10px 28px;border-bottom:1px solid var(--border);flex-shrink:0}}
+.topbar h1{{font-family:'IBM Plex Mono',monospace;font-size:16px;font-weight:600;color:var(--accent)}}
+.topbar .right{{display:flex;align-items:center;gap:16px}}
+.topbar .meta{{color:var(--muted);font-family:'IBM Plex Mono',monospace;font-size:11px}}
+.view-toggle{{display:flex;gap:2px;background:var(--surface);border:1px solid var(--border);
+              border-radius:6px;padding:2px;overflow:hidden}}
+.view-toggle button{{background:none;border:none;color:var(--muted);font-family:'IBM Plex Mono',monospace;
+                     font-size:11px;padding:4px 14px;border-radius:4px;cursor:pointer;transition:.15s}}
+.view-toggle button:hover{{color:var(--text)}}
+.view-toggle button.on{{background:var(--accent);color:#fff}}
+
+/* ═══════════ DECK MODE ═══════════ */
+.deck-wrap{{flex:1;display:flex;flex-direction:column;overflow:hidden}}
+.deck-wrap.hidden{{display:none}}
+.deck{{flex:1;display:flex;align-items:center;justify-content:center;position:relative;
+       overflow:hidden;padding:24px 80px}}
+.slide{{display:none;flex-direction:column;align-items:center;width:100%;max-width:1100px;
+        height:100%;animation:fadeIn .25s ease}}
+.slide.active{{display:flex}}
+@keyframes fadeIn{{from{{opacity:0;transform:translateY(8px)}}to{{opacity:1;transform:translateY(0)}}}}
+.slide.title-slide{{justify-content:center;gap:12px}}
+.slide.title-slide h2{{font-family:'IBM Plex Mono',monospace;font-size:36px;font-weight:600;color:var(--accent)}}
+.slide.title-slide p{{font-size:14px;color:var(--muted);font-family:'IBM Plex Mono',monospace}}
+.slide .step-num{{font-family:'IBM Plex Mono',monospace;font-size:11px;font-weight:600;color:var(--accent);
+                  background:var(--accent12);padding:4px 14px;border-radius:6px;white-space:nowrap;flex-shrink:0}}
+.slide .step-hdr{{display:flex;align-items:center;gap:14px;width:100%;padding:0 4px;flex-shrink:0}}
+.slide .step-desc{{font-size:14px;color:var(--text);line-height:1.5}}
+.slide .img-wrap{{flex:1;display:flex;align-items:center;justify-content:center;
+                  min-height:0;width:100%;padding:14px 0 4px}}
+.slide .img-wrap img{{max-width:100%;max-height:100%;object-fit:contain;border-radius:var(--radius);
+                      border:1px solid var(--border);background:var(--surface)}}
+.slide .note-body{{flex:1;display:flex;align-items:center;justify-content:center;
+                   font-size:18px;color:var(--text);line-height:1.7;text-align:center;
+                   max-width:700px;padding:40px 20px}}
+.nav{{position:absolute;top:50%;transform:translateY(-50%);width:48px;height:48px;border-radius:50%;
+     background:var(--surface);border:1px solid var(--border);color:var(--muted);font-size:22px;
+     display:flex;align-items:center;justify-content:center;cursor:pointer;transition:.15s;z-index:10;
+     user-select:none}}
+.nav:hover{{background:var(--accent);color:#fff;border-color:var(--accent)}}
+.nav.disabled{{opacity:.2;pointer-events:none}}
+.nav.prev{{left:16px}}
+.nav.next{{right:16px}}
+.bottombar{{display:flex;align-items:center;justify-content:center;gap:6px;position:relative;
+            padding:10px 28px;border-top:1px solid var(--border);flex-shrink:0}}
+.dot{{width:8px;height:8px;border-radius:50%;background:var(--border);cursor:pointer;transition:.15s}}
+.dot.active{{background:var(--accent);box-shadow:0 0 6px rgba(61,142,240,.5)}}
+.dot:hover{{background:var(--accent)}}
+.counter{{position:absolute;right:28px;font-family:'IBM Plex Mono',monospace;font-size:11px;color:var(--muted)}}
+
+/* ═══════════ LIST MODE ═══════════ */
+.list-wrap{{flex:1;overflow-y:auto;padding:40px 24px 80px}}
+.list-wrap.hidden{{display:none}}
+.list-inner{{max-width:1020px;margin:0 auto}}
+.card{{background:var(--surface);border:1px solid var(--border);border-radius:10px;overflow:hidden;margin-bottom:28px}}
+.card-hdr{{display:flex;align-items:center;gap:14px;padding:14px 20px;border-bottom:1px solid var(--border)}}
+.card-num{{font-family:'IBM Plex Mono',monospace;font-size:10px;font-weight:600;color:var(--accent);
+           background:var(--accent12);padding:3px 10px;border-radius:4px;white-space:nowrap}}
+.card-desc{{font-size:14px;color:var(--text);line-height:1.55}}
+.card img{{display:block;width:100%;height:auto}}
+.card .card-note{{padding:28px 24px;font-size:15px;line-height:1.7;color:var(--text)}}
+
+.footer{{text-align:center;color:var(--muted);font-size:11px;font-family:'IBM Plex Mono',monospace;
+         margin-top:48px;padding-top:20px;border-top:1px solid var(--border)}}
 </style></head><body>
-<header>
+
+<div class="topbar">
   <h1>{title}</h1>
-  <p>Steps: {len(log_data)}<br>Generated: {datetime.now().strftime('%Y-%m-%d %H:%M')}</p>
-</header>
+  <div class="right">
+    <span class="meta">{total} steps &middot; {gen_date}</span>
+    <div class="view-toggle" id="viewToggle">
+      <button class="on" data-mode="deck">Deck</button>
+      <button data-mode="list">List</button>
+    </div>
+  </div>
+</div>
+
+<!-- ═══════ DECK VIEW ═══════ -->
+<div class="deck-wrap" id="deckWrap">
+  <div class="deck" id="deck">
+    <div class="nav prev disabled" id="prev" onclick="go(-1)">&lsaquo;</div>
+    <div class="nav next" id="next" onclick="go(1)">&rsaquo;</div>
+    <div class="slide title-slide active" data-idx="0">
+      <h2>{title}</h2>
+      <p>{total} steps</p>
+      <p style="margin-top:24px;font-size:12px;color:var(--muted)">Press &rarr; or click to begin</p>
+    </div>
 """)
             for i, entry in enumerate(log_data):
-                sn   = entry["step"]
-                flat = _flatten_to_pil(i)
-                if flat is not None:
-                    buf = io.BytesIO()
-                    flat.save(buf, "PNG")
-                    b64 = base64.b64encode(buf.getvalue()).decode()
-                    img_tag = f'\n  <img src="data:image/png;base64,{b64}" alt="Step {sn}">'
+                sn = entry["step"]
+                desc_html = entry['description'].replace('&','&amp;').replace('<','&lt;').replace('>','&gt;')
+                b64 = step_images[i]
+                if b64 is not None:
+                    body = (f'<div class="img-wrap">'
+                            f'<img src="data:image/png;base64,{b64}" alt="Step {sn}">'
+                            f'</div>')
                 else:
-                    img_tag = ""
-                f.write(f"""<div class="step">
-  <div class="step-header">
-    <span class="step-num">STEP {sn:02d}</span>
-    <span class="step-desc">{entry['description']}</span>
-  </div>{img_tag}
-</div>
+                    body = f'<div class="note-body">{desc_html}</div>'
+                f.write(f"""    <div class="slide" data-idx="{i+1}">
+      <div class="step-hdr"><span class="step-num">STEP {sn:02d}</span><span class="step-desc">{desc_html}</span></div>
+      {body}
+    </div>
 """)
-            f.write(f'<footer>Generated by PSR Pro &nbsp;·&nbsp; {datetime.now().year}</footer>\n</body></html>')
+
+            f.write(f"""  </div>
+  <div class="bottombar" id="dots"><span class="counter" id="counter">0 / {total}</span></div>
+</div>
+
+<!-- ═══════ LIST VIEW ═══════ -->
+<div class="list-wrap hidden" id="listWrap">
+  <div class="list-inner">
+""")
+            for i, entry in enumerate(log_data):
+                sn = entry["step"]
+                desc_html = entry['description'].replace('&','&amp;').replace('<','&lt;').replace('>','&gt;')
+                b64 = step_images[i]
+                if b64 is not None:
+                    img_tag = f'\n    <img src="data:image/png;base64,{b64}" alt="Step {sn}">'
+                else:
+                    img_tag = f'\n    <div class="card-note">{desc_html}</div>'
+                f.write(f"""    <div class="card">
+      <div class="card-hdr"><span class="card-num">STEP {sn:02d}</span><span class="card-desc">{desc_html}</span></div>{img_tag}
+    </div>
+""")
+
+            f.write(f"""    <div class="footer">Generated by PSR Pro &middot; {gen_year}</div>
+  </div>
+</div>
+
+<script>
+/* ── view toggle ── */
+const deckWrap=document.getElementById('deckWrap'),
+      listWrap=document.getElementById('listWrap'),
+      toggleBtns=document.querySelectorAll('#viewToggle button');
+let mode='deck';
+function setMode(m){{
+  mode=m;
+  deckWrap.classList.toggle('hidden',m!=='deck');
+  listWrap.classList.toggle('hidden',m!=='list');
+  toggleBtns.forEach(b=>b.classList.toggle('on',b.dataset.mode===m));
+}}
+toggleBtns.forEach(b=>b.addEventListener('click',()=>setMode(b.dataset.mode)));
+
+/* ── deck navigation ── */
+const slides=document.querySelectorAll('.slide'),
+      dots=document.getElementById('dots'),
+      counter=document.getElementById('counter'),
+      prevBtn=document.getElementById('prev'),
+      nextBtn=document.getElementById('next'),
+      N=slides.length;
+let cur=0;
+for(let i=0;i<N;i++){{
+  const d=document.createElement('span');
+  d.className='dot'+(i===0?' active':'');
+  d.onclick=()=>goTo(i);
+  dots.insertBefore(d,counter);
+}}
+const allDots=dots.querySelectorAll('.dot');
+function goTo(i){{
+  if(i<0||i>=N)return;
+  slides[cur].classList.remove('active');
+  allDots[cur].classList.remove('active');
+  cur=i;
+  slides[cur].classList.add('active');
+  allDots[cur].classList.add('active');
+  counter.textContent=cur===0?'0 / {total}':(cur+' / {total}');
+  prevBtn.classList.toggle('disabled',cur===0);
+  nextBtn.classList.toggle('disabled',cur===N-1);
+}}
+function go(d){{goTo(cur+d)}}
+document.addEventListener('keydown',e=>{{
+  if(mode!=='deck')return;
+  if(e.key==='ArrowRight'||e.key===' '){{e.preventDefault();go(1)}}
+  if(e.key==='ArrowLeft'){{e.preventDefault();go(-1)}}
+  if(e.key==='Home'){{e.preventDefault();goTo(0)}}
+  if(e.key==='End'){{e.preventDefault();goTo(N-1)}}
+}});
+document.getElementById('deck').addEventListener('click',e=>{{
+  if(e.target.closest('.nav'))return;
+  go(1);
+}});
+</script>
+</body></html>""")
     except Exception as exc:
         messagebox.showerror("HTML Export Error", f"Failed to export HTML:\n{exc}")
         return
