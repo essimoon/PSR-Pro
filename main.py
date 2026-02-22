@@ -88,6 +88,8 @@ step_crops: dict   = {}
 undo_stacks: dict  = {}
 
 annotation_tool = "none"   # "none"|"highlight"|"redact"|"crop"|"draw"
+capture_on_click  = True
+capture_on_hotkey = False
 draw_color      = "#e74c3c"
 draw_width      = 3
 
@@ -308,8 +310,7 @@ def _key_str(key):
 
 
 def _on_click(x, y, button, pressed):
-    # Screenshot on mouse-UP so external drawing is captured
-    if (not pressed) and recording:
+    if (not pressed) and recording and capture_on_click:
         btn = str(button).replace("Button.", "")
         event_queue.put(f"released {btn} mouse button at ({x}, {y})")
 
@@ -317,6 +318,14 @@ def _on_click(x, y, button, pressed):
 def _on_press_key(key):
     if not recording:
         return
+
+    if capture_on_hotkey and key == keyboard.Key.scroll_lock:
+        event_queue.put("manual capture (Scroll Lock)")
+        return
+
+    if not capture_on_click:
+        return
+
     with _keys_lock:
         pressed_keys.add(key)
         mods     = [k for k in pressed_keys if k in MODIFIER_KEYS]
@@ -2311,6 +2320,35 @@ ctk.CTkButton(toolbar, text="📂  Open", command=load_recording,
 ctk.CTkButton(toolbar, text="＋  Step", command=lambda: insert_custom_step(),
     fg_color=C["surface"], hover_color="#1d7a43", width=100, **_B
 ).pack(side="left", padx=3, pady=11)
+
+# ── Capture mode ──────────────────────────────────────────────────────────────────
+
+ctk.CTkLabel(toolbar, text="│", text_color=C["border"], width=14).pack(side="left")
+ctk.CTkLabel(toolbar, text="Capture:", font=("Segoe UI", 10),
+             text_color=C["muted"]).pack(side="left", padx=(4,6))
+
+_cap_click_var  = tk.BooleanVar(value=True)
+_cap_hotkey_var = tk.BooleanVar(value=False)
+
+def _sync_capture_mode(*_):
+    global capture_on_click, capture_on_hotkey
+    capture_on_click  = _cap_click_var.get()
+    capture_on_hotkey = _cap_hotkey_var.get()
+
+_cap_click_var.trace_add("write", _sync_capture_mode)
+_cap_hotkey_var.trace_add("write", _sync_capture_mode)
+
+ctk.CTkCheckBox(toolbar, text="Per click",
+    variable=_cap_click_var, font=("Segoe UI", 10), text_color=C["text"],
+    fg_color=C["accent"], hover_color=C["acc_dark"], border_color=C["border"],
+    height=36, checkbox_width=16, checkbox_height=16, corner_radius=4
+).pack(side="left", padx=(0,6), pady=11)
+
+ctk.CTkCheckBox(toolbar, text="Per Scroll Lock",
+    variable=_cap_hotkey_var, font=("Segoe UI", 10), text_color=C["text"],
+    fg_color=C["accent"], hover_color=C["acc_dark"], border_color=C["border"],
+    height=36, checkbox_width=16, checkbox_height=16, corner_radius=4
+).pack(side="left", padx=(0,4), pady=11)
 
 # ── Project name ──────────────────────────────────────────────────────────────────
 
