@@ -1,0 +1,19 @@
+{
+    "project_name": "Recording 2026-02-22 19:33",
+    "steps": [
+        {
+            "step": 1,
+            "description": "In 'PSR Pro \u2014 Recording 2026-02-22 19:33', released left mouse button at (371, 207)",
+            "screenshot": "step_1.png",
+            "objects": [],
+            "crop": null
+        },
+        {
+            "step": 2,
+            "description": "Test",
+            "screenshot": null,
+            "objects": [],
+            "crop": null
+        }
+    ]
+}
