@@ -7,6 +7,7 @@ Mouse-up screenshot capture · Per-step undo · Continue recording
 
 Dependencies:
     pip install customtkinter pillow mss pynput pygetwindow fpdf2
+    pip install tkinterdnd2          # optional: enables drag-and-drop
 """
 
 import copy, io, os, json, queue, subprocess, sys, threading, base64, webbrowser
@@ -15,7 +16,7 @@ from datetime import datetime
 import tkinter as tk
 from tkinter import filedialog, messagebox
 import customtkinter as ctk
-from PIL import Image, ImageTk, ImageDraw
+from PIL import Image, ImageTk, ImageDraw, ImageGrab
 import mss, mss.tools
 from pynput import mouse, keyboard
 from fpdf import FPDF
@@ -25,6 +26,12 @@ try:
     _HAS_GW = True
 except ImportError:
     _HAS_GW = False
+
+try:
+    from tkinterdnd2 import TkinterDnD
+    _HAS_DND = True
+except ImportError:
+    _HAS_DND = False
 
 
 # ══════════════════════════════════════ THEME ══════════════════════════════════════
@@ -81,6 +88,8 @@ step_crops: dict   = {}
 undo_stacks: dict  = {}
 
 annotation_tool = "none"   # "none"|"highlight"|"redact"|"crop"|"draw"
+capture_on_click  = True
+capture_on_hotkey = False
 draw_color      = "#e74c3c"
 draw_width      = 3
 
@@ -301,8 +310,7 @@ def _key_str(key):
 
 
 def _on_click(x, y, button, pressed):
-    # Screenshot on mouse-UP so external drawing is captured
-    if (not pressed) and recording:
+    if (not pressed) and recording and capture_on_click:
         btn = str(button).replace("Button.", "")
         event_queue.put(f"released {btn} mouse button at ({x}, {y})")
 
@@ -310,6 +318,14 @@ def _on_click(x, y, button, pressed):
 def _on_press_key(key):
     if not recording:
         return
+
+    if capture_on_hotkey and key == keyboard.Key.scroll_lock:
+        event_queue.put("manual capture (Scroll Lock)")
+        return
+
+    if not capture_on_click:
+        return
+
     with _keys_lock:
         pressed_keys.add(key)
         mods     = [k for k in pressed_keys if k in MODIFIER_KEYS]
@@ -493,6 +509,217 @@ def insert_custom_step(after_index=None):
     step_counter = len(log_data) + 1
     _renumber_and_rebuild(scroll_to=insert_pos)
     _set_status(f"✔  Custom step inserted at position {insert_pos + 1}", C["success"])
+
+
+# ══════════════════════════════════════ QUICK INSERT ══════════════════════════════════════
+
+_IMG_EXTS = {'.png', '.jpg', '.jpeg', '.bmp', '.webp', '.gif'}
+
+
+def _insert_step_image(src, insert_pos=None, desc=None):
+    """Create a step from a file path (str) or PIL Image. Returns the insert index."""
+    if not current_session:
+        return None
+    if insert_pos is None:
+        insert_pos = len(log_data)
+
+    fname = f"step_paste_{datetime.now().strftime('%H%M%S%f')}.png"
+    dst   = os.path.join(current_session, fname)
+
+    if isinstance(src, str):
+        Image.open(src).convert("RGB").save(dst, "PNG")
+        desc = desc or os.path.basename(src)
+    else:
+        src.convert("RGB").save(dst, "PNG")
+        desc = desc or "Pasted image"
+
+    _shift_step_data_up(insert_pos)
+    log_data.insert(insert_pos, {
+        "step":        insert_pos + 1,
+        "description": desc,
+        "screenshot":  fname,
+    })
+    step_objects[insert_pos] = []
+
+    global step_counter
+    step_counter = len(log_data) + 1
+    return insert_pos
+
+
+def _insert_step_text(text, insert_pos=None):
+    """Create a text-only step. Returns the insert index."""
+    if not current_session:
+        return None
+    if insert_pos is None:
+        insert_pos = len(log_data)
+
+    _shift_step_data_up(insert_pos)
+    log_data.insert(insert_pos, {
+        "step":        insert_pos + 1,
+        "description": text[:4000],
+        "screenshot":  None,
+    })
+    step_objects[insert_pos] = []
+
+    global step_counter
+    step_counter = len(log_data) + 1
+    return insert_pos
+
+
+# ══════════════════════════════════════ PASTE & DROP ══════════════════════════════════════
+
+def _active_insert_pos():
+    """Return the insert position after the currently active card, or end."""
+    card = active_card_ref[0]
+    if card is not None and card.index < len(log_data):
+        return card.index + 1
+    return len(log_data)
+
+
+def _handle_paste(event=None):
+    """Ctrl+V — create new step(s) from clipboard image or text."""
+    focus = root.focus_get()
+    if focus:
+        wclass = focus.winfo_class()
+        if wclass in ('Text', 'Entry', 'TEntry', 'Spinbox', 'TSpinbox'):
+            return
+
+    if not current_session:
+        _set_status("Start or open a recording to paste into", C["warn"])
+        return "break"
+
+    pos = _active_insert_pos()
+
+    try:
+        clip = ImageGrab.grabclipboard()
+        if clip is not None:
+            if isinstance(clip, Image.Image):
+                _insert_step_image(clip, pos)
+                _renumber_and_rebuild(scroll_to=pos)
+                _set_status(f"✔  Pasted image as step {pos + 1}", C["success"])
+                return "break"
+            if isinstance(clip, list):
+                count = 0
+                for p in clip:
+                    if isinstance(p, str) and os.path.splitext(p)[1].lower() in _IMG_EXTS:
+                        _insert_step_image(p, pos + count)
+                        count += 1
+                if count:
+                    _renumber_and_rebuild(scroll_to=pos)
+                    _set_status(f"✔  Pasted {count} image(s) starting at step {pos + 1}", C["success"])
+                    return "break"
+    except Exception:
+        pass
+
+    try:
+        text = root.clipboard_get()
+        if text and text.strip():
+            _insert_step_text(text.strip(), pos)
+            _renumber_and_rebuild(scroll_to=pos)
+            _set_status(f"✔  Pasted text as step {pos + 1}", C["success"])
+            return "break"
+    except Exception:
+        pass
+
+
+def _drop_insert_pos(x_root, y_root):
+    """Compute insertion index from screen coords using visible cards."""
+    if not step_cards:
+        return 0
+    if view_mode == "grid":
+        best, best_dist = 0, float("inf")
+        for i, card in enumerate(step_cards):
+            try:
+                wx = card.outer.winfo_rootx()
+                wy = card.outer.winfo_rooty()
+                ww = card.outer.winfo_width()
+                wh = card.outer.winfo_height()
+                dist = abs(y_root - (wy + wh // 2)) * 2 + abs(x_root - (wx + ww // 2))
+                if dist < best_dist:
+                    best_dist = dist
+                    best = i
+            except Exception:
+                pass
+        return best
+    for i, card in enumerate(step_cards):
+        try:
+            wy = card.outer.winfo_rooty()
+            wh = card.outer.winfo_height()
+            if y_root < wy + wh // 2:
+                return i
+        except Exception:
+            pass
+    return len(step_cards)
+
+
+def _handle_file_drop(raw_paths, x_root, y_root):
+    """Process file paths dropped onto the app."""
+    if not current_session:
+        _set_status("Start or open a recording to drop into", C["warn"])
+        return
+
+    try:
+        paths = root.tk.splitlist(raw_paths)
+    except Exception:
+        paths = raw_paths.split()
+
+    pos   = _drop_insert_pos(x_root, y_root)
+    count = 0
+
+    for fpath in paths:
+        fpath = fpath.strip()
+        if not os.path.isfile(fpath):
+            continue
+        ext = os.path.splitext(fpath)[1].lower()
+        if ext in _IMG_EXTS:
+            _insert_step_image(fpath, pos + count)
+            count += 1
+        elif ext in ('.txt', '.md', '.log'):
+            try:
+                with open(fpath, 'r', encoding='utf-8', errors='replace') as f:
+                    text = f.read(4000).strip()
+                if text:
+                    _insert_step_text(text, pos + count)
+                    count += 1
+            except Exception:
+                pass
+
+    if count:
+        _renumber_and_rebuild(scroll_to=pos)
+        _set_status(f"✔  Dropped {count} item(s) at step {pos + 1}", C["success"])
+    else:
+        _set_status("No supported files found in drop", C["muted"])
+
+
+def _setup_dnd():
+    """Register the cards panel as a drag-and-drop target (requires tkinterdnd2)."""
+    if not _HAS_DND:
+        return
+    try:
+        tkdnd_path = os.path.join(os.path.dirname(
+            __import__('tkinterdnd2').__file__), 'tkdnd')
+        root.tk.call('lappend', 'auto_path', tkdnd_path)
+        root.tk.eval('package require tkdnd')
+    except Exception:
+        return
+
+    target_w = right_frame._w
+
+    def _tcl_drop(*args):
+        raw = root.tk.getvar('::_psr_drop_data')
+        x   = root.winfo_pointerx()
+        y   = root.winfo_pointery()
+        root.after(0, lambda: _handle_file_drop(raw, x, y))
+
+    cmd = root.register(_tcl_drop)
+
+    try:
+        root.tk.call('tkdnd::drop_target', 'register', target_w, 'DND_Files')
+        root.tk.eval(
+            f'bind {target_w} <<Drop:DND_Files>> '
+            f'{{set ::_psr_drop_data %D; {cmd}}}')
+    except Exception as e:
+        print(f"[PSR] DnD setup failed: {e}")
 
 
 # ══════════════════════════════════════ DESC AUTO-SAVE ══════════════════════════════════════
@@ -1144,18 +1371,11 @@ class ListCard:
     def _load_thumb(self):
         if not current_session:
             return
-        entry    = log_data[self.index]
-        img_path = os.path.join(current_session, entry["screenshot"])
-        if not os.path.exists(img_path):
+        flat = _flatten_to_pil(self.index)
+        if flat is None:
             return
-        img = Image.open(img_path).convert("RGB")
-        cx1, cy1, cx2, cy2 = _get_crop(self.index, img.size)
-        cx1, cx2 = sorted([cx1, cx2]); cy1, cy2 = sorted([cy1, cy2])
-        cx1 = max(0, min(cx1, img.size[0])); cy1 = max(0, min(cy1, img.size[1]))
-        cx2 = max(cx1+1, min(cx2, img.size[0])); cy2 = max(cy1+1, min(cy2, img.size[1]))
-        cropped = img.crop((cx1, cy1, cx2, cy2))
-        cropped.thumbnail((LIST_THUMB_W, 68), Image.LANCZOS)
-        self._photo = ImageTk.PhotoImage(cropped)
+        flat.thumbnail((LIST_THUMB_W, 68), Image.LANCZOS)
+        self._photo = ImageTk.PhotoImage(flat)
         self._thumb_label.configure(image=self._photo)
 
     def _delete(self):
@@ -1247,18 +1467,11 @@ class GridCard:
     def _load_thumb(self):
         if not current_session:
             return
-        entry    = log_data[self.index]
-        img_path = os.path.join(current_session, entry["screenshot"])
-        if not os.path.exists(img_path):
+        flat = _flatten_to_pil(self.index)
+        if flat is None:
             return
-        img = Image.open(img_path).convert("RGB")
-        cx1, cy1, cx2, cy2 = _get_crop(self.index, img.size)
-        cx1, cx2 = sorted([cx1, cx2]); cy1, cy2 = sorted([cy1, cy2])
-        cx1 = max(0, min(cx1, img.size[0])); cy1 = max(0, min(cy1, img.size[1]))
-        cx2 = max(cx1+1, min(cx2, img.size[0])); cy2 = max(cy1+1, min(cy2, img.size[1]))
-        cropped = img.crop((cx1, cy1, cx2, cy2))
-        cropped.thumbnail((GRID_TILE_W-4, 150), Image.LANCZOS)
-        self._photo = ImageTk.PhotoImage(cropped)
+        flat.thumbnail((GRID_TILE_W-4, 150), Image.LANCZOS)
+        self._photo = ImageTk.PhotoImage(flat)
         self._thumb_label.configure(image=self._photo)
 
     def _delete(self):
@@ -1957,6 +2170,20 @@ def export_html():
         messagebox.showwarning("Nothing to export", "No steps to export."); return
     title       = _export_title()
     report_path = _export_filename("html")
+    total       = len(log_data)
+    gen_date    = datetime.now().strftime('%Y-%m-%d %H:%M')
+    gen_year    = datetime.now().year
+
+    # Pre-encode all images once (shared by both views)
+    step_images = []
+    for i, entry in enumerate(log_data):
+        flat = _flatten_to_pil(i)
+        if flat is not None:
+            buf = io.BytesIO()
+            flat.save(buf, "PNG")
+            step_images.append(base64.b64encode(buf.getvalue()).decode())
+        else:
+            step_images.append(None)
 
     try:
         with open(report_path, "w", encoding="utf-8") as f:
@@ -1966,45 +2193,196 @@ def export_html():
 <style>
 @import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;600&family=IBM+Plex+Sans:wght@300;400;600&display=swap');
 *,*::before,*::after{{box-sizing:border-box;margin:0;padding:0}}
-:root{{--bg:#0e0e0e;--surface:#181818;--border:#252525;--accent:#3d8ef0;--text:#e2e2e2;--muted:#666}}
+:root{{--bg:#0e0e0e;--surface:#141414;--border:#252525;--accent:#3d8ef0;--accent12:rgba(61,142,240,.12);
+       --text:#e2e2e2;--muted:#666;--radius:12px}}
+html,body{{height:100%}}
 body{{background:var(--bg);color:var(--text);font-family:'IBM Plex Sans',sans-serif;font-weight:300;
-     max-width:1020px;margin:0 auto;padding:60px 24px 90px}}
-header{{display:flex;align-items:flex-end;justify-content:space-between;
-        border-bottom:1px solid var(--border);padding-bottom:20px;margin-bottom:52px}}
-header h1{{font-family:'IBM Plex Mono',monospace;font-size:24px;font-weight:600;color:var(--accent)}}
-header p{{color:var(--muted);font-family:'IBM Plex Mono',monospace;font-size:12px;text-align:right;line-height:1.8}}
-.step{{background:var(--surface);border:1px solid var(--border);border-radius:10px;overflow:hidden;margin-bottom:28px}}
-.step-header{{display:flex;align-items:center;gap:14px;padding:14px 20px;border-bottom:1px solid var(--border)}}
-.step-num{{font-family:'IBM Plex Mono',monospace;font-size:10px;font-weight:600;color:var(--accent);
-          background:rgba(61,142,240,.12);padding:3px 10px;border-radius:4px;white-space:nowrap}}
-.step-desc{{font-size:14px;color:var(--text);line-height:1.55}}
-.step img{{display:block;width:100%;height:auto}}
-footer{{text-align:center;color:var(--muted);font-size:11px;font-family:'IBM Plex Mono',monospace;
-        margin-top:56px;padding-top:20px;border-top:1px solid var(--border)}}
+     display:flex;flex-direction:column;overflow:hidden}}
+
+/* ── top bar ── */
+.topbar{{display:flex;align-items:center;justify-content:space-between;
+         padding:10px 28px;border-bottom:1px solid var(--border);flex-shrink:0}}
+.topbar h1{{font-family:'IBM Plex Mono',monospace;font-size:16px;font-weight:600;color:var(--accent)}}
+.topbar .right{{display:flex;align-items:center;gap:16px}}
+.topbar .meta{{color:var(--muted);font-family:'IBM Plex Mono',monospace;font-size:11px}}
+.view-toggle{{display:flex;gap:2px;background:var(--surface);border:1px solid var(--border);
+              border-radius:6px;padding:2px;overflow:hidden}}
+.view-toggle button{{background:none;border:none;color:var(--muted);font-family:'IBM Plex Mono',monospace;
+                     font-size:11px;padding:4px 14px;border-radius:4px;cursor:pointer;transition:.15s}}
+.view-toggle button:hover{{color:var(--text)}}
+.view-toggle button.on{{background:var(--accent);color:#fff}}
+
+/* ═══════════ DECK MODE ═══════════ */
+.deck-wrap{{flex:1;display:flex;flex-direction:column;overflow:hidden}}
+.deck-wrap.hidden{{display:none}}
+.deck{{flex:1;display:flex;align-items:center;justify-content:center;position:relative;
+       overflow:hidden;padding:24px 80px}}
+.slide{{display:none;flex-direction:column;align-items:center;width:100%;max-width:1100px;
+        height:100%;animation:fadeIn .25s ease}}
+.slide.active{{display:flex}}
+@keyframes fadeIn{{from{{opacity:0;transform:translateY(8px)}}to{{opacity:1;transform:translateY(0)}}}}
+.slide.title-slide{{justify-content:center;gap:12px}}
+.slide.title-slide h2{{font-family:'IBM Plex Mono',monospace;font-size:36px;font-weight:600;color:var(--accent)}}
+.slide.title-slide p{{font-size:14px;color:var(--muted);font-family:'IBM Plex Mono',monospace}}
+.slide .step-num{{font-family:'IBM Plex Mono',monospace;font-size:11px;font-weight:600;color:var(--accent);
+                  background:var(--accent12);padding:4px 14px;border-radius:6px;white-space:nowrap;flex-shrink:0}}
+.slide .step-hdr{{display:flex;align-items:center;gap:14px;width:100%;padding:0 4px;flex-shrink:0}}
+.slide .step-desc{{font-size:14px;color:var(--text);line-height:1.5}}
+.slide .img-wrap{{flex:1;display:flex;align-items:center;justify-content:center;
+                  min-height:0;width:100%;padding:14px 0 4px}}
+.slide .img-wrap img{{max-width:100%;max-height:100%;object-fit:contain;border-radius:var(--radius);
+                      border:1px solid var(--border);background:var(--surface)}}
+.slide .note-body{{flex:1;display:flex;align-items:center;justify-content:center;
+                   font-size:18px;color:var(--text);line-height:1.7;text-align:center;
+                   max-width:700px;padding:40px 20px}}
+.nav{{position:absolute;top:50%;transform:translateY(-50%);width:48px;height:48px;border-radius:50%;
+     background:var(--surface);border:1px solid var(--border);color:var(--muted);font-size:22px;
+     display:flex;align-items:center;justify-content:center;cursor:pointer;transition:.15s;z-index:10;
+     user-select:none}}
+.nav:hover{{background:var(--accent);color:#fff;border-color:var(--accent)}}
+.nav.disabled{{opacity:.2;pointer-events:none}}
+.nav.prev{{left:16px}}
+.nav.next{{right:16px}}
+.bottombar{{display:flex;align-items:center;justify-content:center;gap:6px;position:relative;
+            padding:10px 28px;border-top:1px solid var(--border);flex-shrink:0}}
+.dot{{width:8px;height:8px;border-radius:50%;background:var(--border);cursor:pointer;transition:.15s}}
+.dot.active{{background:var(--accent);box-shadow:0 0 6px rgba(61,142,240,.5)}}
+.dot:hover{{background:var(--accent)}}
+.counter{{position:absolute;right:28px;font-family:'IBM Plex Mono',monospace;font-size:11px;color:var(--muted)}}
+
+/* ═══════════ LIST MODE ═══════════ */
+.list-wrap{{flex:1;overflow-y:auto;padding:40px 24px 80px}}
+.list-wrap.hidden{{display:none}}
+.list-inner{{max-width:1020px;margin:0 auto}}
+.card{{background:var(--surface);border:1px solid var(--border);border-radius:10px;overflow:hidden;margin-bottom:28px}}
+.card-hdr{{display:flex;align-items:center;gap:14px;padding:14px 20px;border-bottom:1px solid var(--border)}}
+.card-num{{font-family:'IBM Plex Mono',monospace;font-size:10px;font-weight:600;color:var(--accent);
+           background:var(--accent12);padding:3px 10px;border-radius:4px;white-space:nowrap}}
+.card-desc{{font-size:14px;color:var(--text);line-height:1.55}}
+.card img{{display:block;width:100%;height:auto}}
+.card .card-note{{padding:28px 24px;font-size:15px;line-height:1.7;color:var(--text)}}
+
+.footer{{text-align:center;color:var(--muted);font-size:11px;font-family:'IBM Plex Mono',monospace;
+         margin-top:48px;padding-top:20px;border-top:1px solid var(--border)}}
 </style></head><body>
-<header>
+
+<div class="topbar">
   <h1>{title}</h1>
-  <p>Steps: {len(log_data)}<br>Generated: {datetime.now().strftime('%Y-%m-%d %H:%M')}</p>
-</header>
+  <div class="right">
+    <span class="meta">{total} steps &middot; {gen_date}</span>
+    <div class="view-toggle" id="viewToggle">
+      <button class="on" data-mode="deck">Deck</button>
+      <button data-mode="list">List</button>
+    </div>
+  </div>
+</div>
+
+<!-- ═══════ DECK VIEW ═══════ -->
+<div class="deck-wrap" id="deckWrap">
+  <div class="deck" id="deck">
+    <div class="nav prev disabled" id="prev" onclick="go(-1)">&lsaquo;</div>
+    <div class="nav next" id="next" onclick="go(1)">&rsaquo;</div>
+    <div class="slide title-slide active" data-idx="0">
+      <h2>{title}</h2>
+      <p>{total} steps</p>
+      <p style="margin-top:24px;font-size:12px;color:var(--muted)">Press &rarr; or click to begin</p>
+    </div>
 """)
             for i, entry in enumerate(log_data):
-                sn   = entry["step"]
-                flat = _flatten_to_pil(i)
-                if flat is not None:
-                    buf = io.BytesIO()
-                    flat.save(buf, "PNG")
-                    b64 = base64.b64encode(buf.getvalue()).decode()
-                    img_tag = f'\n  <img src="data:image/png;base64,{b64}" alt="Step {sn}">'
+                sn = entry["step"]
+                desc_html = entry['description'].replace('&','&amp;').replace('<','&lt;').replace('>','&gt;')
+                b64 = step_images[i]
+                if b64 is not None:
+                    body = (f'<div class="img-wrap">'
+                            f'<img src="data:image/png;base64,{b64}" alt="Step {sn}">'
+                            f'</div>')
                 else:
-                    img_tag = ""
-                f.write(f"""<div class="step">
-  <div class="step-header">
-    <span class="step-num">STEP {sn:02d}</span>
-    <span class="step-desc">{entry['description']}</span>
-  </div>{img_tag}
-</div>
+                    body = f'<div class="note-body">{desc_html}</div>'
+                f.write(f"""    <div class="slide" data-idx="{i+1}">
+      <div class="step-hdr"><span class="step-num">STEP {sn:02d}</span><span class="step-desc">{desc_html}</span></div>
+      {body}
+    </div>
 """)
-            f.write(f'<footer>Generated by PSR Pro &nbsp;·&nbsp; {datetime.now().year}</footer>\n</body></html>')
+
+            f.write(f"""  </div>
+  <div class="bottombar" id="dots"><span class="counter" id="counter">0 / {total}</span></div>
+</div>
+
+<!-- ═══════ LIST VIEW ═══════ -->
+<div class="list-wrap hidden" id="listWrap">
+  <div class="list-inner">
+""")
+            for i, entry in enumerate(log_data):
+                sn = entry["step"]
+                desc_html = entry['description'].replace('&','&amp;').replace('<','&lt;').replace('>','&gt;')
+                b64 = step_images[i]
+                if b64 is not None:
+                    img_tag = f'\n    <img src="data:image/png;base64,{b64}" alt="Step {sn}">'
+                else:
+                    img_tag = f'\n    <div class="card-note">{desc_html}</div>'
+                f.write(f"""    <div class="card">
+      <div class="card-hdr"><span class="card-num">STEP {sn:02d}</span><span class="card-desc">{desc_html}</span></div>{img_tag}
+    </div>
+""")
+
+            f.write(f"""    <div class="footer">Generated by PSR Pro &middot; {gen_year}</div>
+  </div>
+</div>
+
+<script>
+/* ── view toggle ── */
+const deckWrap=document.getElementById('deckWrap'),
+      listWrap=document.getElementById('listWrap'),
+      toggleBtns=document.querySelectorAll('#viewToggle button');
+let mode='deck';
+function setMode(m){{
+  mode=m;
+  deckWrap.classList.toggle('hidden',m!=='deck');
+  listWrap.classList.toggle('hidden',m!=='list');
+  toggleBtns.forEach(b=>b.classList.toggle('on',b.dataset.mode===m));
+}}
+toggleBtns.forEach(b=>b.addEventListener('click',()=>setMode(b.dataset.mode)));
+
+/* ── deck navigation ── */
+const slides=document.querySelectorAll('.slide'),
+      dots=document.getElementById('dots'),
+      counter=document.getElementById('counter'),
+      prevBtn=document.getElementById('prev'),
+      nextBtn=document.getElementById('next'),
+      N=slides.length;
+let cur=0;
+for(let i=0;i<N;i++){{
+  const d=document.createElement('span');
+  d.className='dot'+(i===0?' active':'');
+  d.onclick=()=>goTo(i);
+  dots.insertBefore(d,counter);
+}}
+const allDots=dots.querySelectorAll('.dot');
+function goTo(i){{
+  if(i<0||i>=N)return;
+  slides[cur].classList.remove('active');
+  allDots[cur].classList.remove('active');
+  cur=i;
+  slides[cur].classList.add('active');
+  allDots[cur].classList.add('active');
+  counter.textContent=cur===0?'0 / {total}':(cur+' / {total}');
+  prevBtn.classList.toggle('disabled',cur===0);
+  nextBtn.classList.toggle('disabled',cur===N-1);
+}}
+function go(d){{goTo(cur+d)}}
+document.addEventListener('keydown',e=>{{
+  if(mode!=='deck')return;
+  if(e.key==='ArrowRight'||e.key===' '){{e.preventDefault();go(1)}}
+  if(e.key==='ArrowLeft'){{e.preventDefault();go(-1)}}
+  if(e.key==='Home'){{e.preventDefault();goTo(0)}}
+  if(e.key==='End'){{e.preventDefault();goTo(N-1)}}
+}});
+document.getElementById('deck').addEventListener('click',e=>{{
+  if(e.target.closest('.nav'))return;
+  go(1);
+}});
+</script>
+</body></html>""")
     except Exception as exc:
         messagebox.showerror("HTML Export Error", f"Failed to export HTML:\n{exc}")
         return
@@ -2108,6 +2486,35 @@ ctk.CTkButton(toolbar, text="＋  Step", command=lambda: insert_custom_step(),
     fg_color=C["surface"], hover_color="#1d7a43", width=100, **_B
 ).pack(side="left", padx=3, pady=11)
 
+# ── Capture mode ──────────────────────────────────────────────────────────────────
+
+ctk.CTkLabel(toolbar, text="│", text_color=C["border"], width=14).pack(side="left")
+ctk.CTkLabel(toolbar, text="Capture:", font=("Segoe UI", 10),
+             text_color=C["muted"]).pack(side="left", padx=(4,6))
+
+_cap_click_var  = tk.BooleanVar(value=True)
+_cap_hotkey_var = tk.BooleanVar(value=False)
+
+def _sync_capture_mode(*_):
+    global capture_on_click, capture_on_hotkey
+    capture_on_click  = _cap_click_var.get()
+    capture_on_hotkey = _cap_hotkey_var.get()
+
+_cap_click_var.trace_add("write", _sync_capture_mode)
+_cap_hotkey_var.trace_add("write", _sync_capture_mode)
+
+ctk.CTkCheckBox(toolbar, text="Per click",
+    variable=_cap_click_var, font=("Segoe UI", 10), text_color=C["text"],
+    fg_color=C["accent"], hover_color=C["acc_dark"], border_color=C["border"],
+    height=36, checkbox_width=16, checkbox_height=16, corner_radius=4
+).pack(side="left", padx=(0,6), pady=11)
+
+ctk.CTkCheckBox(toolbar, text="Per Scroll Lock",
+    variable=_cap_hotkey_var, font=("Segoe UI", 10), text_color=C["text"],
+    fg_color=C["accent"], hover_color=C["acc_dark"], border_color=C["border"],
+    height=36, checkbox_width=16, checkbox_height=16, corner_radius=4
+).pack(side="left", padx=(0,4), pady=11)
+
 # ── Project name ──────────────────────────────────────────────────────────────────
 
 ctk.CTkLabel(toolbar, text="Project:", font=("Segoe UI", 10),
@@ -2142,29 +2549,29 @@ tool_strip.pack_propagate(False)
 ctk.CTkLabel(tool_strip, text="TOOLS", font=("Segoe UI", 9, "bold"),
              text_color=C["muted"], width=54).pack(side="left", padx=(14,4))
 
-_TB = dict(height=30, corner_radius=5, font=("Segoe UI", 11), border_width=1, width=110)
+_TB = dict(height=30, corner_radius=5, font=("Segoe UI", 11), border_width=1, width=126)
 
-btn_pointer = ctk.CTkButton(tool_strip, text="🖱  Pointer",
+btn_pointer = ctk.CTkButton(tool_strip, text="🖱  Pointer (V)",
     fg_color=C["acc_dark"], border_color=C["accent"], hover_color=C["acc_dark"],
     command=lambda: set_tool("none"), **_TB)
 btn_pointer.pack(side="left", padx=3, pady=10)
 
-btn_highlight = ctk.CTkButton(tool_strip, text="🔴  Highlight",
+btn_highlight = ctk.CTkButton(tool_strip, text="🔴  Highlight (U)",
     fg_color="transparent", border_color=C["border"], hover_color="#4a1010",
     command=lambda: set_tool("highlight"), **_TB)
 btn_highlight.pack(side="left", padx=3, pady=10)
 
-btn_redact = ctk.CTkButton(tool_strip, text="⬛  Redact",
+btn_redact = ctk.CTkButton(tool_strip, text="⬛  Redact (M)",
     fg_color="transparent", border_color=C["border"], hover_color="#1a1a1a",
     command=lambda: set_tool("redact"), **_TB)
 btn_redact.pack(side="left", padx=3, pady=10)
 
-btn_crop = ctk.CTkButton(tool_strip, text="✂  Crop",
+btn_crop = ctk.CTkButton(tool_strip, text="✂  Crop (C)",
     fg_color="transparent", border_color=C["border"], hover_color="#3a3010",
     command=lambda: set_tool("crop"), **_TB)
 btn_crop.pack(side="left", padx=3, pady=10)
 
-btn_draw = ctk.CTkButton(tool_strip, text="✏  Draw",
+btn_draw = ctk.CTkButton(tool_strip, text="✏  Draw (B)",
     fg_color="transparent", border_color=C["border"], hover_color="#1a2a1a",
     command=lambda: set_tool("draw"), **_TB)
 btn_draw.pack(side="left", padx=3, pady=10)
@@ -2266,11 +2673,43 @@ def _on_root_key(event):
             card.delete_selected()
             return "break"
 
+
+def _on_tool_hotkey(event):
+    focus = root.focus_get()
+    if focus:
+        wclass = focus.winfo_class()
+        if wclass in ('Text', 'Entry', 'TEntry', 'Spinbox', 'TSpinbox'):
+            return
+    _TOOL_KEYS = {'v': 'none', 'u': 'highlight', 'm': 'redact', 'c': 'crop', 'b': 'draw'}
+    tool = _TOOL_KEYS.get(event.char.lower())
+    if tool:
+        set_tool(tool)
+        return "break"
+
+
+def _on_undo(event=None):
+    focus = root.focus_get()
+    if focus:
+        wclass = focus.winfo_class()
+        if wclass in ('Text', 'Entry', 'TEntry', 'Spinbox', 'TSpinbox'):
+            return
+    card = active_card_ref[0]
+    if card is not None and not card.is_text_only:
+        card._undo()
+        return "break"
+
+
 root.bind("<Delete>",    _on_root_key)
 root.bind("<BackSpace>", _on_root_key)
+root.bind("<Control-v>", _handle_paste)
+root.bind("<Control-z>", _on_undo)
+for _hk in ('v', 'u', 'm', 'c', 'b'):
+    root.bind(f"<KeyPress-{_hk}>", _on_tool_hotkey)
+    root.bind(f"<KeyPress-{_hk.upper()}>", _on_tool_hotkey)
 
 
 # ══════════════════════════════════════ START ══════════════════════════════════════
 
 root.after(100, process_queue)
+root.after(300, _setup_dnd)
 root.mainloop()
