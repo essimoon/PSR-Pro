@@ -10,14 +10,14 @@ Dependencies:
     pip install tkinterdnd2          # optional: enables drag-and-drop
 """
 
-import copy, io, os, re, json, queue, subprocess, sys, threading, base64, webbrowser
+import copy, html as _html, io, os, re, json, queue, subprocess, sys, time, threading, base64, webbrowser
 from datetime import datetime
 
 import tkinter as tk
 from tkinter import filedialog, messagebox
 import customtkinter as ctk
 from PIL import Image, ImageTk, ImageDraw, ImageGrab
-import mss, mss.tools
+import mss
 from pynput import mouse, keyboard
 from fpdf import FPDF
 
@@ -93,7 +93,9 @@ capture_on_hotkey = False
 capture_keyboard  = False   # record key presses / shortcuts (off by default)
 ignore_psr_focus  = True    # skip recording input while a PSR window is active
 paused            = False   # recording is running but events are suppressed
-_rec_log: list    = []      # [(step_num, short_desc), …] for the live log in rec_panel
+capture_delay_ms  = 100     # ms to wait before taking screenshot (lets menus/hovers render)
+capture_format    = "jpg"   # "jpg" (fast, smaller) or "png" (lossless)
+_last_capture     = [("", "", "", None)]  # (step, keyword, rest, color)
 draw_color      = "#e74c3c"
 draw_width      = 3
 
@@ -228,11 +230,17 @@ def _open_folder(filepath):
 
 
 def _flatten_to_pil(step_index):
-    """Composite crop + all vector objects onto screenshot. Returns a flat RGB PIL image, or None for text-only."""
+    """Composite crop + all vector objects onto screenshot. Returns a flat RGB PIL image, or None for text-only / missing."""
     entry = log_data[step_index]
     if entry.get("screenshot") is None:
         return None
-    img = Image.open(os.path.join(current_session, entry["screenshot"])).convert("RGB")
+    img_path = os.path.join(current_session, entry["screenshot"])
+    if not os.path.exists(img_path):
+        return None
+    try:
+        img = Image.open(img_path).convert("RGB")
+    except Exception:
+        return None
     orig_w, orig_h = img.size
 
     # Apply non-destructive crop
@@ -285,20 +293,25 @@ def _safe_folder_name(name):
     return name[:80] if name else ""
 
 
-def create_session():
+def create_session(parent_dir=None):
+    """Create the session folder. parent_dir: where to create it (default BASE_DIR)."""
     global current_session
+    base = (parent_dir if parent_dir is not None else BASE_DIR)
     ts = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
     try:
         pname = _safe_folder_name(project_name_var.get())
     except Exception:
         pname = ""
     folder = f"{pname}_{ts}" if pname else ts
-    current_session = os.path.join(BASE_DIR, folder)
+    current_session = os.path.join(base, folder)
     os.makedirs(current_session)
 
 
 def save_steps():
     if not current_session:
+        return
+    if not os.path.isdir(current_session):
+        _set_status("⚠ Session folder missing — cannot save", C["danger"])
         return
     data = []
     for i, entry in enumerate(log_data):
@@ -311,16 +324,31 @@ def save_steps():
     except Exception:
         pname = project_name
     doc = {"project_name": pname, "steps": data}
-    with open(os.path.join(current_session, "steps.json"), "w", encoding="utf-8") as f:
-        json.dump(doc, f, indent=4)
+    try:
+        with open(os.path.join(current_session, "steps.json"), "w", encoding="utf-8") as f:
+            json.dump(doc, f, indent=4)
+    except OSError as exc:
+        _set_status(f"⚠ Save failed: {exc}", C["danger"])
 
+
+CAPTURE_MAX_W = 1920  # cap screenshot width — matches Windows Steps Recorder behaviour
 
 def capture_screenshot(filename):
     filepath = os.path.join(current_session, filename)
     with mss.mss() as sct:
         shot = sct.grab(sct.monitors[1])
-        mss.tools.to_png(shot.rgb, shot.size, output=filepath)
-    return filepath
+        img = Image.frombytes("RGB", shot.size, shot.rgb)
+    if img.width > CAPTURE_MAX_W:
+        ratio = CAPTURE_MAX_W / img.width
+        img = img.resize((CAPTURE_MAX_W, int(img.height * ratio)), Image.BILINEAR)
+    base = filepath.rsplit(".", 1)[0]
+    if capture_format == "png":
+        out = base + ".png"
+        img.save(out, "PNG")
+    else:
+        out = base + ".jpg"
+        img.save(out, "JPEG", quality=85)
+    return out
 
 
 def get_active_window():
@@ -339,7 +367,9 @@ def handle_event(event_text):
     global step_counter
     if not recording or not current_session:
         return
-    filename = f"step_{step_counter}.png"
+    if capture_delay_ms > 0:
+        time.sleep(capture_delay_ms / 1000.0)
+    filename = f"step_{step_counter}.{capture_format}"
     try:
         capture_screenshot(filename)
     except Exception as exc:
@@ -353,9 +383,34 @@ def handle_event(event_text):
     }
     log_data.append(entry)
     step_objects[step_counter - 1] = []
-    _rec_log.append((step_counter, event_text[:48]))
-    if len(_rec_log) > 4:
-        _rec_log.pop(0)
+    # Extract the input keyword and color-code it in the tray
+    et = event_text
+    if "mouse" in et:
+        # "released left mouse button at (x, y)" → keyword="left mouse button"
+        m = re.match(r"released (\w+ mouse button) at", et)
+        _cap_kw    = m.group(1) if m else "mouse"
+        _cap_rest  = et[m.end():].strip() if m else ""
+        _cap_color = C["accent"]       # blue
+    elif "shortcut" in et:
+        # "used keyboard shortcut CTRL + S" → keyword="CTRL + S"
+        _cap_kw    = et.replace("used keyboard shortcut ", "")
+        _cap_rest  = ""
+        _cap_color = "#e0a030"         # orange
+    elif "key" in et:
+        # "pressed A key" → keyword="A"
+        m = re.match(r"pressed (.+?) key", et)
+        _cap_kw    = m.group(1) if m else et
+        _cap_rest  = "key"
+        _cap_color = "#e0a030"         # orange
+    elif "Scroll Lock" in et:
+        _cap_kw    = "Scroll Lock"
+        _cap_rest  = ""
+        _cap_color = C["success"]      # green
+    else:
+        _cap_kw    = et[:40]
+        _cap_rest  = ""
+        _cap_color = C["text"]
+    _last_capture[0] = (f"#{step_counter}", _cap_kw, _cap_rest, _cap_color)
     save_steps()
     root.after(0, _append_card)
     root.after(0, _update_rec_panel)
@@ -366,7 +421,7 @@ def handle_event(event_text):
 
 def _key_str(key):
     try:    return key.char.upper()
-    except: return str(key).replace("Key.", "").upper()
+    except Exception: return str(key).replace("Key.", "").upper()
 
 
 def _psr_is_active():
@@ -382,7 +437,14 @@ def _on_click(x, y, button, pressed):
         event_queue.put(f"released {btn} mouse button at ({x}, {y})")
 
 
+_show_tray_flag = [False]  # set by pynput thread, consumed by tkinter main loop
+
 def _on_press_key(key):
+    # F8 toggles tray visibility — works even when window is hidden
+    if key == keyboard.Key.f8 and recording:
+        _show_tray_flag[0] = True
+        return
+
     if not recording or paused:
         return
 
@@ -438,6 +500,14 @@ def process_queue():
         handle_event(text)
     except queue.Empty:
         pass
+    # Check if F8 was pressed (pynput thread) to restore/minimize tray
+    if _show_tray_flag[0]:
+        _show_tray_flag[0] = False
+        if recording:
+            if _rec_minimized[0]:
+                _restore_rec_tray()
+            else:
+                _minimize_rec_tray()
     root.after(100, process_queue)
 
 
@@ -806,7 +876,8 @@ def _setup_desc_autosave(card):
     try:
         card.desc_box._textbox.configure(undo=True, maxundo=-1)
         card.desc_box._textbox.edit_reset()
-    except: pass
+    except Exception:
+        pass
     card._desc_timer = None
     def _on_key(event):
         if card._desc_timer:
@@ -819,7 +890,7 @@ def _flush_desc(card):
     card._desc_timer = None
     try:
         new_text = card.desc_box.get("1.0", "end").strip()
-    except:
+    except Exception:
         return
     if card.index < len(log_data) and log_data[card.index]["description"] != new_text:
         log_data[card.index]["description"] = new_text
@@ -863,7 +934,7 @@ def _delete_selected():
                 img_path = os.path.join(current_session, screenshot)
                 if os.path.exists(img_path):
                     try: os.remove(img_path)
-                    except: pass
+                    except Exception: pass
             clear_undo_stack(old_idx)
         else:
             new_log.append(log_data[old_idx])
@@ -898,7 +969,7 @@ def _apply_sidebar_selection():
     sidebar_list.selection_clear(0, tk.END)
     for i in _selected:
         try: sidebar_list.selection_set(i)
-        except: pass
+        except Exception: pass
 
 
 class BaseCard:
@@ -933,8 +1004,7 @@ class StepCard(BaseCard):
         self._drag_info    = None
 
         self._build(parent)
-        if not self.is_text_only:
-            self.reload_image()
+        self._loaded = False
         _bind_card_context(self)
 
     def _toggle_fold(self):
@@ -1045,6 +1115,8 @@ class StepCard(BaseCard):
         self.canvas.bind("<B1-Motion>",       self._on_drag)
         self.canvas.bind("<ButtonRelease-1>", self._on_release)
         self.canvas.bind("<Motion>",          self._on_motion)
+        self.canvas.bind("<Button-3>",        self._on_canvas_right_click)
+        self.canvas.bind("<Double-Button-1>", self._on_canvas_dblclick)
 
     def _build_desc(self):
         h = 100 if self.is_text_only else 56
@@ -1076,7 +1148,12 @@ class StepCard(BaseCard):
         self._crop_region = (cx1, cy1, cx2, cy2)
 
         cropped  = img.crop((cx1, cy1, cx2, cy2))
-        ratio    = min(CARD_IMG_MAX_W / cropped.size[0], 1.0)
+        try:
+            avail_w = self.outer.winfo_width() - 4
+        except Exception:
+            avail_w = CARD_IMG_MAX_W
+        max_w    = max(CARD_IMG_MAX_W, avail_w) if avail_w > 100 else CARD_IMG_MAX_W
+        ratio    = min(max_w / cropped.size[0], 1.0)
         dw       = int(cropped.size[0] * ratio)
         dh       = int(cropped.size[1] * ratio)
         self._disp_size = (dw, dh)
@@ -1377,6 +1454,74 @@ class StepCard(BaseCard):
         else:
             self.canvas.configure(cursor="arrow")
 
+    # ── Right-click context menu on canvas objects ───────────────────────
+
+    def _on_canvas_right_click(self, event):
+        hit = self._obj_at(event.x, event.y)
+        if hit is not None:
+            self._selected_obj = hit
+            self._render_objects()
+            self._update_color_swatches_for_selection()
+        menu = tk.Menu(self.canvas, tearoff=0, bg=C["surface"], fg=C["text"],
+                       activebackground=C["accent"], activeforeground="#fff",
+                       font=("Segoe UI", 10))
+        if self._selected_obj is not None:
+            objects = step_objects.get(self.index, [])
+            if self._selected_obj < len(objects):
+                obj = objects[self._selected_obj]
+                label = obj["type"].capitalize()
+                menu.add_command(label=f"Delete {label}  [Del]", command=self.delete_selected)
+                if obj["type"] != "redact":
+                    color_sub = tk.Menu(menu, tearoff=0, bg=C["surface"], fg=C["text"],
+                        activebackground=C["accent"], activeforeground="#fff",
+                        font=("Segoe UI", 10))
+                    for hex_col, col_lbl in _SWATCHES:
+                        color_sub.add_command(label=f"● {col_lbl}",
+                            foreground=hex_col,
+                            command=lambda c=hex_col: self.apply_color_to_selection(c))
+                    menu.add_cascade(label="Colour", menu=color_sub)
+                menu.add_separator()
+        menu.add_command(label="Full view", command=lambda: self._show_fullscreen())
+        try:
+            menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            menu.grab_release()
+
+    # ── Double-click for fullscreen image view ─────────────────────────
+
+    def _on_canvas_dblclick(self, event):
+        if annotation_tool != "none":
+            return
+        self._show_fullscreen()
+
+    def _show_fullscreen(self):
+        """Open a maximized top-level window showing the full annotated image."""
+        flat = _flatten_to_pil(self.index)
+        if flat is None:
+            return
+        win = tk.Toplevel(root)
+        win.title(f"Step {log_data[self.index]['step']:02d} — Full View")
+        win.configure(bg="#111111")
+        win.attributes("-topmost", True)
+        win.state("zoomed")
+
+        sw = win.winfo_screenwidth()
+        sh = win.winfo_screenheight()
+        ratio = min(sw / flat.width, sh / flat.height, 1.0)
+        dw = int(flat.width * ratio)
+        dh = int(flat.height * ratio)
+        resized = flat.resize((dw, dh), Image.LANCZOS)
+        photo = ImageTk.PhotoImage(resized)
+
+        canvas = tk.Canvas(win, bg="#111111", highlightthickness=0)
+        canvas.pack(fill="both", expand=True)
+        canvas.create_image(sw // 2, sh // 2, anchor="center", image=photo)
+        canvas._photo_ref = photo  # prevent GC
+
+        win.bind("<Escape>", lambda e: win.destroy())
+        win.bind("<Button-1>", lambda e: win.destroy())
+        win.focus_set()
+
     # ── Selection helpers ─────────────────────────────────────────────────
 
     def _update_color_swatches_for_selection(self):
@@ -1438,20 +1583,12 @@ class StepCard(BaseCard):
         _set_status("↺  Crop reset to original", C["success"])
 
     def _move_up(self):
-        i = self.index
-        if i == 0: return
-        log_data[i], log_data[i-1] = log_data[i-1], log_data[i]
-        step_objects[i], step_objects[i-1] = step_objects.get(i-1,[]), step_objects.get(i,[])
-        step_crops[i],   step_crops[i-1]   = step_crops.get(i-1),     step_crops.get(i)
-        _renumber_and_rebuild(scroll_to=i-1)
+        if self.index > 0:
+            _swap_steps(self.index, self.index - 1)
 
     def _move_down(self):
-        i = self.index
-        if i >= len(log_data)-1: return
-        log_data[i], log_data[i+1] = log_data[i+1], log_data[i]
-        step_objects[i], step_objects[i+1] = step_objects.get(i+1,[]), step_objects.get(i,[])
-        step_crops[i],   step_crops[i+1]   = step_crops.get(i+1),     step_crops.get(i)
-        _renumber_and_rebuild(scroll_to=i+1)
+        if self.index < len(log_data) - 1:
+            _swap_steps(self.index, self.index + 1)
 
     # ── Helpers ───────────────────────────────────────────────────────────
 
@@ -1538,11 +1675,15 @@ class ListCard(BaseCard):
     def _load_thumb(self):
         if not current_session:
             return
-        flat = _flatten_to_pil(self.index)
-        if flat is None:
+        entry = log_data[self.index]
+        if entry.get("screenshot") is None:
             return
-        flat.thumbnail((LIST_THUMB_W, 68), Image.LANCZOS)
-        self._photo = ImageTk.PhotoImage(flat)
+        img_path = os.path.join(current_session, entry["screenshot"])
+        if not os.path.exists(img_path):
+            return
+        img = Image.open(img_path).convert("RGB")
+        img.thumbnail((LIST_THUMB_W, 68), Image.BILINEAR)
+        self._photo = ImageTk.PhotoImage(img)
         self._thumb_label.configure(image=self._photo)
 
 
@@ -1608,11 +1749,15 @@ class GridCard(BaseCard):
     def _load_thumb(self):
         if not current_session:
             return
-        flat = _flatten_to_pil(self.index)
-        if flat is None:
+        entry = log_data[self.index]
+        if entry.get("screenshot") is None:
             return
-        flat.thumbnail((GRID_TILE_W-4, 150), Image.LANCZOS)
-        self._photo = ImageTk.PhotoImage(flat)
+        img_path = os.path.join(current_session, entry["screenshot"])
+        if not os.path.exists(img_path):
+            return
+        img = Image.open(img_path).convert("RGB")
+        img.thumbnail((GRID_TILE_W-4, 150), Image.BILINEAR)
+        self._photo = ImageTk.PhotoImage(img)
         self._thumb_label.configure(image=self._photo)
 
 
@@ -1622,12 +1767,12 @@ def _clear_cards():
     _card_drag_cleanup()
     active_card_ref[0] = None
     for card in step_cards:
-        try:    card.outer.destroy()
-        except: pass
+        try: card.outer.destroy()
+        except Exception: pass
     step_cards.clear()
     for child in list(cards_scroll.winfo_children()):
         try: child.destroy()
-        except: pass
+        except Exception: pass
 
 
 def _refresh_ui_state():
@@ -1677,6 +1822,37 @@ def _build_all_cards():
     _refresh_ui_state()
     root.after(30, _reset_cards_scroll)
     root.after(50, _refresh_card_highlights)
+    root.after(80, _lazy_load_visible_cards)
+
+
+def _lazy_load_visible_cards():
+    """Load images only for cards currently visible in the scroll viewport."""
+    try:
+        canvas = cards_scroll._parent_canvas
+        cy = canvas.winfo_rooty()
+        ch = canvas.winfo_height()
+    except Exception:
+        return
+    for card in step_cards:
+        if not isinstance(card, StepCard) or card._loaded or card.is_text_only:
+            continue
+        try:
+            wy = card.outer.winfo_rooty()
+            wh = card.outer.winfo_height()
+        except Exception:
+            continue
+        if wy + wh >= cy and wy <= cy + ch:
+            card._loaded = True
+            card.reload_image()
+
+
+_lazy_load_timer = [None]
+
+def _on_cards_scroll(*_args):
+    """Debounced lazy loading — avoids firing per-pixel during fast scrolls."""
+    if _lazy_load_timer[0]:
+        root.after_cancel(_lazy_load_timer[0])
+    _lazy_load_timer[0] = root.after(100, _lazy_load_visible_cards)
 
 
 def _reset_cards_scroll():
@@ -1705,6 +1881,15 @@ def _append_card():
         return
     _refresh_sidebar()
     root.after(80, lambda: cards_scroll._parent_canvas.yview_moveto(1.0))
+    root.after(120, _lazy_load_visible_cards)
+
+
+def _swap_steps(a, b):
+    """Swap two adjacent steps and rebuild."""
+    log_data[a], log_data[b] = log_data[b], log_data[a]
+    step_objects[a], step_objects[b] = step_objects.get(b, []), step_objects.get(a, [])
+    step_crops[a], step_crops[b] = step_crops.get(b), step_crops.get(a)
+    _renumber_and_rebuild(scroll_to=min(a, b))
 
 
 def _renumber_and_rebuild(scroll_to=None):
@@ -1820,10 +2005,8 @@ def _sidebar_press(event):
     shift = (event.state & 0x0001) != 0
     if ctrl:
         _sel_anchor = idx
-        # EXTENDED mode toggles the item; don't start a drag
-    elif shift:
-        pass  # EXTENDED mode extends from anchor; keep existing anchor
-    else:
+    elif not shift:
+        # Plain click — start potential drag
         _sel_anchor = idx
         _sidebar_drag["src"]    = idx
         _sidebar_drag["dst"]    = idx
@@ -1969,19 +2152,21 @@ def _bind_card_context(card):
             if not isinstance(widget, (tk.Text, ctk.CTkEntry, ctk.CTkButton,
                                         tk.Button, ctk.CTkCheckBox)):
                 try: widget.bind("<Double-Button-1>", _on_dbl)
-                except: pass
+                except Exception: pass
             for child in widget.winfo_children():
                 _bind_dbl(child)
         _bind_dbl(card.outer)
 
     def _bind_recursive(widget):
+        # Skip tk.Canvas — it has its own annotation-aware right-click handler
+        if isinstance(widget, tk.Canvas):
+            return
         try: widget.bind("<Button-3>", _on_right)
-        except: pass
-        # Bind left-click for selection on non-interactive widgets
+        except Exception: pass
         if not isinstance(widget, (tk.Text, ctk.CTkEntry, ctk.CTkButton,
                                     tk.Button, ctk.CTkCheckBox)):
             try: widget.bind("<ButtonPress-1>", _on_left, add="+")
-            except: pass
+            except Exception: pass
         for child in widget.winfo_children():
             _bind_recursive(child)
 
@@ -2002,25 +2187,25 @@ def _card_drag_cleanup():
     ghost = _card_drag.pop("ghost", None)
     if ghost:
         try: ghost.destroy()
-        except: pass
+        except Exception: pass
     _card_drag["ghost"] = None
 
     line = _card_drag.pop("line", None)
     if line:
         try: line.destroy()
-        except: pass
+        except Exception: pass
     _card_drag["line"] = None
 
     hi = _card_drag.get("hi_card", -1)
     if 0 <= hi < len(step_cards):
         try: step_cards[hi].outer.configure(border_color=C["border"])
-        except: pass
+        except Exception: pass
     _card_drag["hi_card"] = -1
 
     src = _card_drag.get("src", -1)
     if 0 <= src < len(step_cards):
         try: step_cards[src].outer.configure(fg_color=C["card"], border_color=C["border"])
-        except: pass
+        except Exception: pass
 
     _card_drag["active"] = False
     _card_drag["src"]    = -1
@@ -2032,8 +2217,6 @@ def _card_drag_start(index, event):
     _card_drag["active"] = False
 
 
-
-
 def _card_show_drop_line(dst):
     """Show drop feedback: horizontal line for list/default, border highlight for grid."""
     if not step_cards:
@@ -2043,11 +2226,11 @@ def _card_show_drop_line(dst):
         prev_hi = _card_drag.get("hi_card", -1)
         if prev_hi != dst and 0 <= prev_hi < len(step_cards):
             try: step_cards[prev_hi].outer.configure(border_color=C["border"])
-            except: pass
+            except Exception: pass
         _card_drag["hi_card"] = dst
         if 0 <= dst < len(step_cards):
             try: step_cards[dst].outer.configure(border_color=C["accent"])
-            except: pass
+            except Exception: pass
         return
 
     line = _card_drag.get("line")
@@ -2064,21 +2247,8 @@ def _card_show_drop_line(dst):
             ty = target.outer.winfo_y() + target.outer.winfo_height() + 4
         line.place(in_=cards_scroll, x=6, y=ty - 4, width=tw - 12, height=_DROP_LINE_H)
         line.lift()
-    except:
+    except Exception:
         line.place_forget()
-
-
-def _card_hide_drop_line():
-    line = _card_drag.get("line")
-    if line:
-        try: line.place_forget()
-        except: pass
-
-    hi = _card_drag.get("hi_card", -1)
-    if 0 <= hi < len(step_cards):
-        try: step_cards[hi].outer.configure(border_color=C["border"])
-        except: pass
-    _card_drag["hi_card"] = -1
 
 
 def _card_auto_scroll(y_root):
@@ -2091,8 +2261,7 @@ def _card_auto_scroll(y_root):
             canvas.yview_scroll(-3, "units")
         elif y_root > cy + ch - _AUTO_SCROLL:
             canvas.yview_scroll(3, "units")
-    except:
-        pass
+    except Exception: pass
 
 
 def _card_drag_motion(event):
@@ -2120,7 +2289,7 @@ def _card_drag_motion(event):
         _card_drag["ghost"] = ghost
         if src < len(step_cards):
             try: step_cards[src].outer.configure(fg_color="#0c0c0c", border_color="#1a1a1a")
-            except: pass
+            except Exception: pass
 
     ghost.geometry(f"+{event.x_root + 16}+{event.y_root - 12}")
     ghost.lift()
@@ -2165,14 +2334,19 @@ def set_tool(tool):
     for card in step_cards:
         if card.canvas:
             card.canvas.configure(cursor=cursor)
-    # Show colour swatches + pen sizes only when Draw is active
-    if tool == "draw":
+    # Show colour swatches for draw + highlight; pen sizes only for draw
+    if tool in ("draw", "highlight"):
         _draw_sep1.pack(side="left", fill="y", pady=8, padx=6)
         for btn, _ in draw_color_btns:
             btn.pack(side="left", padx=2, pady=12)
-        _draw_sep2.pack(side="left", fill="y", pady=8, padx=6)
-        for btn, _ in pen_size_btns:
-            btn.pack(side="left", padx=2, pady=9)
+        if tool == "draw":
+            _draw_sep2.pack(side="left", fill="y", pady=8, padx=6)
+            for btn, _ in pen_size_btns:
+                btn.pack(side="left", padx=2, pady=9)
+        else:
+            for btn, _ in pen_size_btns:
+                btn.pack_forget()
+            _draw_sep2.pack_forget()
     else:
         for btn, _ in draw_color_btns:
             btn.pack_forget()
@@ -2192,6 +2366,8 @@ def set_tool(tool):
 
 def _sync_color_swatches(hex_color):
     for btn, col in draw_color_btns:
+        if col is None:
+            continue
         btn.configure(
             border_width=2 if col==hex_color else 1,
             border_color="#ffffff" if col==hex_color else "#555555")
@@ -2288,45 +2464,84 @@ def _apply_project_name():
 
 # ══════════════════════════════════════ RECORDING ACTIONS ══════════════════════════════════════
 
-def _prompt_project_name():
-    """Show a dialog to name the project before recording. Returns the name or None to cancel."""
-    ts_default = datetime.now().strftime("Recording %Y-%m-%d %H:%M")
+def _prompt_new_recording():
+    """Combined dialog: project name + save location. Returns (name, parent_dir) or None."""
+    ts_default   = datetime.now().strftime("Recording %Y-%m-%d %H:%M")
+    default_path = os.path.abspath(BASE_DIR)
+
     dlg = ctk.CTkToplevel(root)
     dlg.title("New Recording")
-    dlg.geometry("440x180")
+    dlg.geometry("480x240")
     dlg.resizable(False, False)
     dlg.transient(root)
     dlg.grab_set()
 
+    # Centre on the main window
+    dlg.update_idletasks()
+    rx, ry = root.winfo_rootx(), root.winfo_rooty()
+    rw, rh = root.winfo_width(), root.winfo_height()
+    dw, dh = 480, 240
+    dlg.geometry(f"{dw}x{dh}+{rx + (rw - dw) // 2}+{ry + (rh - dh) // 2}")
+
     result = [None]
 
+    # ── Project name ──
     ctk.CTkLabel(dlg, text="Project Name",
-        font=("Segoe UI", 14, "bold"), text_color=C["text"]
-    ).pack(padx=24, pady=(20,4), anchor="w")
-    ctk.CTkLabel(dlg, text="Used for the folder name and export filenames.",
-        font=("Segoe UI", 10), text_color=C["muted"]
-    ).pack(padx=24, anchor="w")
+        font=("Segoe UI", 13, "bold"), text_color=C["text"]
+    ).pack(padx=24, pady=(20, 2), anchor="w")
 
     name_var = tk.StringVar(value=project_name_var.get().strip() or ts_default)
-    name_entry = ctk.CTkEntry(dlg, textvariable=name_var, width=392,
-        font=("Segoe UI", 12), fg_color=C["surface"],
+    name_entry = ctk.CTkEntry(dlg, textvariable=name_var, width=432,
+        font=("Segoe UI", 11), fg_color=C["surface"],
         border_color=C["border"], text_color=C["text"])
-    name_entry.pack(padx=24, pady=(10,14))
+    name_entry.pack(padx=24, pady=(4, 12))
     name_entry.select_range(0, tk.END)
     name_entry.focus_force()
 
+    # ── Save location ──
+    ctk.CTkLabel(dlg, text="Save to",
+        font=("Segoe UI", 9), text_color=C["muted"]
+    ).pack(padx=24, anchor="w")
+
+    path_row = ctk.CTkFrame(dlg, fg_color="transparent")
+    path_row.pack(fill="x", padx=24, pady=(2, 14))
+
+    path_var = tk.StringVar(value=default_path)
+    path_entry = ctk.CTkEntry(path_row, textvariable=path_var, width=340,
+        font=("Segoe UI", 10), fg_color=C["surface"],
+        border_color=C["border"], text_color=C["muted"], state="readonly")
+    path_entry.pack(side="left")
+
+    def _browse():
+        folder = filedialog.askdirectory(initialdir=path_var.get(), title="Choose folder")
+        if folder:
+            path_var.set(folder)
+
+    ctk.CTkButton(path_row, text="Browse…", command=_browse,
+        fg_color=C["surface"], hover_color="#333", border_width=1,
+        border_color=C["border"], text_color=C["text"],
+        width=80, height=28, corner_radius=5,
+        font=("Segoe UI", 10)).pack(side="left", padx=(8, 0))
+
+    # ── Buttons ──
     btn_row = ctk.CTkFrame(dlg, fg_color="transparent")
-    btn_row.pack(fill="x", padx=24, pady=(0,16))
+    btn_row.pack(fill="x", padx=24, pady=(0, 16))
 
     def do_ok(event=None):
-        result[0] = name_var.get().strip() or ts_default
+        name = name_var.get().strip() or ts_default
+        folder = path_var.get().strip()
+        if not folder:
+            folder = default_path
+        os.makedirs(folder, exist_ok=True)
+        result[0] = (name, folder)
         dlg.destroy()
+
     def do_cancel():
         dlg.destroy()
 
     ctk.CTkButton(btn_row, text="Start Recording", command=do_ok,
         fg_color=C["accent"], hover_color=C["acc_dark"],
-        width=140, height=32).pack(side="right", padx=(8,0))
+        width=140, height=32).pack(side="right", padx=(8, 0))
     ctk.CTkButton(btn_row, text="Cancel", command=do_cancel,
         fg_color="transparent", hover_color=C["surface"], border_width=1,
         border_color=C["border"], text_color=C["muted"],
@@ -2341,14 +2556,16 @@ def _prompt_project_name():
 
 def start_recording():
     global recording, step_counter, log_data, project_name
-    name = _prompt_project_name()
-    if name is None:
+    res = _prompt_new_recording()
+    if res is None:
         return
+    name, parent_dir = res
     project_name = name
     project_name_var.set(project_name)
 
     _selected.clear()
-    create_session()
+    _last_capture[0] = ("", "", "", None)
+    create_session(parent_dir)
     log_data.clear()
     step_objects.clear()
     step_crops.clear()
@@ -2372,7 +2589,6 @@ def stop_recording():
     btn_start.configure(state="normal")
     btn_stop.configure(state="disabled")
     btn_continue.configure(state="normal" if current_session else "disabled")
-    btn_tray.pack_forget()
     show_editing()
 
 
@@ -2573,7 +2789,7 @@ body{{background:var(--bg);color:var(--text);font-family:'IBM Plex Sans',sans-se
 """)
             for i, entry in enumerate(log_data):
                 sn = entry["step"]
-                desc_html = entry['description'].replace('&','&amp;').replace('<','&lt;').replace('>','&gt;')
+                desc_html = _html.escape(entry['description'])
                 b64 = step_images[i]
                 if b64 is not None:
                     body = (f'<div class="img-wrap">'
@@ -2597,7 +2813,7 @@ body{{background:var(--bg);color:var(--text);font-family:'IBM Plex Sans',sans-se
 """)
             for i, entry in enumerate(log_data):
                 sn = entry["step"]
-                desc_html = entry['description'].replace('&','&amp;').replace('<','&lt;').replace('>','&gt;')
+                desc_html = _html.escape(entry['description'])
                 b64 = step_images[i]
                 if b64 is not None:
                     img_tag = f'\n    <img src="data:image/png;base64,{b64}" alt="Step {sn}">'
@@ -2701,7 +2917,8 @@ def export_pdf():
             pdf.set_font("Helvetica","B",10); pdf.set_text_color(61,142,240); pdf.set_xy(16,6)
             pdf.cell(26, 9, f"STEP {entry['step']:02d}", new_x="RIGHT", new_y="LAST")
             pdf.set_font("Helvetica","",9); pdf.set_text_color(210,210,210)
-            pdf.cell(0, 9, _pdf_safe(entry["description"][:120]), new_x="LMARGIN", new_y="NEXT")
+            desc = entry["description"]
+            pdf.cell(0, 9, _pdf_safe(desc[:117] + "…" if len(desc) > 120 else desc), new_x="LMARGIN", new_y="NEXT")
 
             flat = _flatten_to_pil(i)
             if flat is not None:
@@ -2721,7 +2938,7 @@ def export_pdf():
     finally:
         for t in tmp_imgs:
             try: os.remove(t)
-            except: pass
+            except Exception: pass
 
     _set_status("✔  PDF report exported", C["success"])
     _open_folder(report_path)
@@ -2779,10 +2996,6 @@ btn_stop = ctk.CTkButton(toolbar, text="■  Stop", command=stop_recording,
 btn_stop.pack(side="left", padx=3, pady=9)
 tip(btn_stop, "Stop recording  [F6]")
 
-btn_tray = ctk.CTkButton(toolbar, text="◉  Tray", command=lambda: show_recording(),
-    fg_color=C["danger"], hover_color="#a02020", width=80,
-    font=("Segoe UI", 10, "bold"), height=28, corner_radius=5)
-tip(btn_tray, "Back to recording tray — recording stays active")
 
 # Capture mode vars (shared with recording tray — no widgets in toolbar)
 _cap_click_var  = tk.BooleanVar(value=True)
@@ -2879,6 +3092,21 @@ for hex_col, col_lbl in _SWATCHES:
     tip(sw, col_lbl)
 draw_color_btns[0][0].configure(border_width=2, border_color="#ffffff")
 
+def _open_color_picker():
+    from tkinter import colorchooser
+    result = colorchooser.askcolor(color=draw_color, title="Pick Colour")
+    if result and result[1]:
+        _set_draw_color_global(result[1])
+
+_color_picker_btn = ctk.CTkButton(tool_strip, text="⊕", width=22, height=20, corner_radius=10,
+    fg_color="transparent", hover_color=C["surface"],
+    border_width=1, border_color="#555555",
+    font=("Segoe UI", 12), text_color=C["muted"],
+    command=_open_color_picker)
+_color_picker_btn.pack(side="left", padx=(4, 0), pady=12)
+draw_color_btns.append((_color_picker_btn, None))
+tip(_color_picker_btn, "Custom colour picker")
+
 _draw_sep2 = ctk.CTkFrame(tool_strip, width=1, fg_color=C["border"])
 _draw_sep2.pack(side="left", fill="y", pady=8, padx=6)
 
@@ -2962,7 +3190,7 @@ sidebar_list.bind("<Button-3>",        _sidebar_context)
 sidebar_list.bind("<<ListboxSelect>>", _on_sidebar_sel_change)
 
 _dnd_hint = ctk.CTkLabel(sidebar, text="drag to reorder  ·  right-click to insert",
-    font=("Segoe UI", 8), text_color=C["muted"], height=20)
+    font=("Segoe UI", 9), text_color=C["muted"], height=20)
 _dnd_hint.pack(fill="x", padx=8, pady=(0,6))
 
 right_frame = ctk.CTkFrame(body, corner_radius=8, fg_color=C["panel"])
@@ -3027,111 +3255,263 @@ def _pin_scroll_width(event):
     except Exception:
         pass
 cards_scroll._parent_canvas.bind("<Configure>", _pin_scroll_width)
+cards_scroll.bind_all("<MouseWheel>", lambda e: _on_cards_scroll(), add="+")
 
 
 # ══════════════════════════════════════ RECORDING PANEL ══════════════════════════════════════
-# Compact horizontal rectangle: ~420 × 172 px, parked top-right corner.
+# Floating toolbar — borderless, fully draggable, snipping-tool style.
+# Row 1:  [⠿ ● ■ ⏸]  [⚙]  [▾]
+# Row 2:  [#12  ↳ left mouse button at (512,340)          project-name]
 
-# ── Row 1: status · project name · step count ─────────────────────────────────────────────
-_rec_hdr = ctk.CTkFrame(rec_panel, height=40, corner_radius=0, fg_color=C["panel"])
-_rec_hdr.pack(fill="x")
-_rec_hdr.pack_propagate(False)
+_rec_row1 = ctk.CTkFrame(rec_panel, height=36, corner_radius=0, fg_color=C["panel"])
+_rec_row1.pack(fill="x")
+_rec_row1.pack_propagate(False)
 
-_rec_status = ctk.CTkLabel(_rec_hdr, text="● RECORDING",
-    font=("Segoe UI", 10, "bold"), text_color=C["danger"])
-_rec_status.pack(side="left", padx=(12, 6), pady=10)
+# — Left: grip + status + action buttons —
+_rec_grip = ctk.CTkLabel(_rec_row1, text="⠿", font=("Segoe UI", 14),
+    text_color="#555", width=16, cursor="fleur")
+_rec_grip.pack(side="left", padx=(8, 2))
 
-ctk.CTkLabel(_rec_hdr, text="·", text_color=C["border"]).pack(side="left")
+_rec_status = ctk.CTkLabel(_rec_row1, text="●",
+    font=("Segoe UI", 10, "bold"), text_color=C["danger"], width=14)
+_rec_status.pack(side="left", padx=(0, 4))
 
-_rec_project = ctk.CTkLabel(_rec_hdr, text="",
-    font=("Segoe UI", 10), text_color=C["text"])
-_rec_project.pack(side="left", padx=(6, 4))
+_AB = dict(height=24, corner_radius=4, font=("Segoe UI", 10))
 
-_rec_steps = ctk.CTkLabel(_rec_hdr, text="0 steps",
-    font=("Courier New", 10, "bold"), text_color=C["accent"])
-_rec_steps.pack(side="right", padx=12)
-
-# ── Row 2: [Stop] [Edit] | [Click] [Hotkey] [Keys] [No PSR] ───────────────────────────────
-_rec_ctrl = ctk.CTkFrame(rec_panel, height=36, fg_color=C["surface"])
-_rec_ctrl.pack(fill="x")
-_rec_ctrl.pack_propagate(False)
-
-_rec_stop_btn = ctk.CTkButton(_rec_ctrl, text="■  Stop", command=stop_recording,
-    fg_color=C["danger"], hover_color="#a02020",
-    width=64, height=26, corner_radius=5,
-    font=("Segoe UI", 10, "bold"), border_width=0)
-_rec_stop_btn.pack(side="left", padx=(8, 3), pady=5)
+_rec_stop_btn = ctk.CTkButton(_rec_row1, text="■", command=stop_recording,
+    fg_color=C["danger"], hover_color="#a02020", width=28, border_width=0, **_AB)
+_rec_stop_btn.pack(side="left", padx=(0, 2), pady=6)
 tip(_rec_stop_btn, "Stop recording  [F6]")
 
-_btn_pause = ctk.CTkButton(_rec_ctrl, text="⏸", command=lambda: _toggle_pause(),
+_btn_pause = ctk.CTkButton(_rec_row1, text="⏸", command=lambda: _toggle_pause(),
     fg_color="transparent", hover_color=C["warn"],
-    width=32, height=26, corner_radius=5,
-    font=("Segoe UI", 12), border_width=1, border_color=C["border"])
-_btn_pause.pack(side="left", padx=(0, 3), pady=5)
-tip(_btn_pause, "Pause / resume capturing  [F7]")
+    width=28, border_width=1, border_color=C["border"], **_AB)
+_btn_pause.pack(side="left", padx=(0, 2), pady=6)
+tip(_btn_pause, "Pause / resume  [F7]")
 
-_rec_edit_btn = ctk.CTkButton(_rec_ctrl, text="◱", command=lambda: show_editing(),
-    fg_color="transparent", hover_color="#333",
-    width=32, height=26, corner_radius=5,
-    font=("Segoe UI", 12), border_width=1, border_color=C["border"])
-_rec_edit_btn.pack(side="left", padx=(0, 5), pady=5)
-tip(_rec_edit_btn, "Open edit view — recording keeps running in background")
+# — Capture mode indicators (between actions and right-side buttons) —
+_rec_mode_label = ctk.CTkLabel(_rec_row1, text="",
+    font=("Segoe UI", 9), text_color=C["muted"], anchor="w")
+_rec_mode_label.pack(side="left", padx=(8, 0))
 
-ctk.CTkFrame(_rec_ctrl, width=1, fg_color=C["border"]).pack(side="left", fill="y", pady=6)
+# — Right: minimize —
+_rec_minimized = [False]
 
-_ignore_psr_var   = tk.BooleanVar(value=True)
-_cap_keyboard_var = tk.BooleanVar(value=False)
+def _minimize_rec_tray():
+    _rec_minimized[0] = True
+    root.overrideredirect(False)
+    root.iconify()
 
-def _sync_rec_globals(*_):
-    global ignore_psr_focus, capture_keyboard
-    ignore_psr_focus = _ignore_psr_var.get()
-    capture_keyboard = _cap_keyboard_var.get()
+def _restore_rec_tray():
+    if not _rec_minimized[0]:
+        return
+    _rec_minimized[0] = False
+    root.deiconify()
+    root.overrideredirect(True)
+    root.attributes("-topmost", True)
+    root.lift()
 
-_ignore_psr_var.trace_add("write",   _sync_rec_globals)
-_cap_keyboard_var.trace_add("write", _sync_rec_globals)
+_rec_hide_btn = ctk.CTkButton(_rec_row1, text="▾", command=_minimize_rec_tray,
+    fg_color="transparent", hover_color=C["surface"],
+    text_color="#555", width=22, height=22, corner_radius=4,
+    font=("Segoe UI", 11), border_width=0)
+_rec_hide_btn.pack(side="right", padx=(0, 6))
+tip(_rec_hide_btn, "Minimize to taskbar  [F8]")
 
-_CBO = dict(fg_color=C["accent"], hover_color=C["acc_dark"], border_color=C["border"],
-    height=22, checkbox_width=13, checkbox_height=13, corner_radius=3,
-    font=("Segoe UI", 9))
+# — Settings gear — opens a flyout popup —
+_rec_flyout = None
+_was_paused_before_flyout = [False]
+_flyout_close_bind_id = [None]
 
-_cb_rcl = ctk.CTkCheckBox(_rec_ctrl, text="Mouse",  variable=_cap_click_var,
-    text_color=C["text"], **_CBO)
-_cb_rcl.pack(side="left", padx=(5, 2), pady=5)
-tip(_cb_rcl, "Capture a screenshot on every mouse click")
+def _close_rec_settings():
+    """Close the settings flyout and resume if needed."""
+    global _rec_flyout, paused
+    if _rec_flyout is not None:
+        try: _rec_flyout.destroy()
+        except Exception: pass
+        _rec_flyout = None
+    if _flyout_close_bind_id[0]:
+        try: root.unbind("<Button-1>", _flyout_close_bind_id[0])
+        except Exception: pass
+        _flyout_close_bind_id[0] = None
+    if not _was_paused_before_flyout[0] and paused:
+        paused = False
+        _update_rec_panel()
 
-_cb_rhk = ctk.CTkCheckBox(_rec_ctrl, text="Lock",   variable=_cap_hotkey_var,
-    text_color=C["text"], **_CBO)
-_cb_rhk.pack(side="left", padx=(0, 2), pady=5)
-tip(_cb_rhk, "Capture only when Scroll Lock is pressed")
+def _toggle_settings_flyout():
+    global _rec_flyout, paused
+    if _rec_flyout is not None:
+        _close_rec_settings()
+        return
+    _was_paused_before_flyout[0] = paused
+    if not paused:
+        paused = True
+        _update_rec_panel()
+    x = root.winfo_x()
+    y = root.winfo_y() + root.winfo_height()
+    _rec_flyout = tk.Toplevel(root)
+    _rec_flyout.overrideredirect(True)
+    _rec_flyout.attributes("-topmost", True)
+    _rec_flyout.configure(bg=C["panel"])
 
-_cb_rky = ctk.CTkCheckBox(_rec_ctrl, text="Keyboard", variable=_cap_keyboard_var,
-    text_color=C["text"], **_CBO)
-_cb_rky.pack(side="left", padx=(0, 2), pady=5)
-tip(_cb_rky, "Also record keyboard input and shortcuts")
+    pad = ctk.CTkFrame(_rec_flyout, fg_color=C["panel"], corner_radius=6,
+        border_width=1, border_color=C["border"])
+    pad.pack(fill="both", expand=True, padx=1, pady=1)
 
-_cb_rpsr = ctk.CTkCheckBox(_rec_ctrl, text="Skip PSR", variable=_ignore_psr_var,
-    text_color=C["muted"], **_CBO)
-_cb_rpsr.pack(side="left", padx=(0, 6), pady=5)
-tip(_cb_rpsr, "Ignore clicks/keys while PSR Pro itself is focused")
+    _ignore_psr_var   = tk.BooleanVar(value=ignore_psr_focus)
+    _cap_keyboard_var = tk.BooleanVar(value=capture_keyboard)
 
-# ── Divider + live log ─────────────────────────────────────────────────────────────────────
-ctk.CTkFrame(rec_panel, height=1, fg_color=C["border"]).pack(fill="x")
+    def _sync(*_a):
+        global ignore_psr_focus, capture_keyboard
+        ignore_psr_focus = _ignore_psr_var.get()
+        capture_keyboard = _cap_keyboard_var.get()
+        _update_rec_panel()
+    _ignore_psr_var.trace_add("write", _sync)
+    _cap_keyboard_var.trace_add("write", _sync)
 
-_rec_log_frame = ctk.CTkFrame(rec_panel, fg_color=C["bg"])
-_rec_log_frame.pack(fill="both", expand=True)
+    _CBO = dict(fg_color=C["accent"], hover_color=C["acc_dark"], border_color=C["border"],
+        height=24, checkbox_width=14, checkbox_height=14, corner_radius=3,
+        font=("Segoe UI", 10))
 
-_rec_log_top = ctk.CTkFrame(_rec_log_frame, fg_color="transparent")
-_rec_log_top.pack(fill="x", padx=10, pady=(5, 2))
-ctk.CTkLabel(_rec_log_top, text="LOG",
-    font=("Segoe UI", 8, "bold"), text_color=C["muted"]).pack(side="left")
+    ctk.CTkLabel(pad, text="Capture", font=("Segoe UI", 9, "bold"),
+        text_color=C["muted"]).pack(anchor="w", padx=10, pady=(8, 2))
 
-_rec_log_labels = []
-for _ in range(3):
-    lbl = ctk.CTkLabel(_rec_log_frame, text="",
-        font=("Segoe UI", 9), text_color=C["muted"],
-        anchor="w", wraplength=396)
-    lbl.pack(fill="x", padx=10, pady=1)
-    _rec_log_labels.append(lbl)
+    for _cvar, _ctxt, _ctip in (
+        (_cap_click_var,    "Mouse clicks",      "Capture on every mouse click"),
+        (_cap_hotkey_var,   "Scroll Lock key",   "Capture on Scroll Lock press"),
+        (_cap_keyboard_var, "Keyboard shortcuts", "Record keyboard combos as steps"),
+        (_ignore_psr_var,   "Ignore this tray",   "Don't record clicks on this toolbar"),
+    ):
+        cb = ctk.CTkCheckBox(pad, text=_ctxt, variable=_cvar,
+            text_color=C["text"], **_CBO)
+        cb.pack(anchor="w", padx=12, pady=2)
+        tip(cb, _ctip)
+
+    ctk.CTkFrame(pad, height=1, fg_color=C["border"]).pack(fill="x", padx=8, pady=6)
+
+    ctk.CTkLabel(pad, text="Screenshot", font=("Segoe UI", 9, "bold"),
+        text_color=C["muted"]).pack(anchor="w", padx=10, pady=(0, 2))
+
+    _DDS = dict(height=24, corner_radius=4,
+        fg_color=C["surface"], button_color=C["border"], button_hover_color=C["acc_dark"],
+        dropdown_fg_color=C["surface"], dropdown_hover_color=C["acc_dark"],
+        font=("Segoe UI", 10), dropdown_font=("Segoe UI", 10), text_color=C["text"])
+
+    row_d = ctk.CTkFrame(pad, fg_color="transparent")
+    row_d.pack(fill="x", padx=10, pady=2)
+    ctk.CTkLabel(row_d, text="Delay", font=("Segoe UI", 10),
+        text_color=C["muted"], width=48).pack(side="left")
+
+    _delay_var = tk.StringVar(value=f"{capture_delay_ms}ms")
+    _DELAY_OPTS = ["0ms", "50ms", "100ms", "200ms"]
+    def _on_delay(*_a):
+        global capture_delay_ms
+        raw = _delay_var.get().replace("ms", "")
+        try: capture_delay_ms = int(raw)
+        except Exception: capture_delay_ms = 100
+    _delay_var.trace_add("write", _on_delay)
+    ctk.CTkOptionMenu(row_d, variable=_delay_var, values=_DELAY_OPTS, width=70, **_DDS
+        ).pack(side="left", padx=(4, 0))
+
+    row_f = ctk.CTkFrame(pad, fg_color="transparent")
+    row_f.pack(fill="x", padx=10, pady=(2, 8))
+    ctk.CTkLabel(row_f, text="Format", font=("Segoe UI", 10),
+        text_color=C["muted"], width=48).pack(side="left")
+
+    _fmt_var_local = tk.StringVar(value=capture_format.upper())
+    def _on_fmt(*_a):
+        global capture_format
+        capture_format = _fmt_var_local.get().lower()
+    _fmt_var_local.trace_add("write", _on_fmt)
+    ctk.CTkOptionMenu(row_f, variable=_fmt_var_local, values=["JPG", "PNG"], width=70, **_DDS
+        ).pack(side="left", padx=(4, 0))
+
+    _rec_flyout.update_idletasks()
+    _rec_flyout.geometry(f"+{x}+{y}")
+
+    # Delayed bind so the opening click doesn't immediately trigger close
+    def _bind_close():
+        def _on_click(e):
+            if _rec_flyout is None or not _rec_flyout.winfo_exists():
+                return
+            try:
+                wx, wy = _rec_flyout.winfo_rootx(), _rec_flyout.winfo_rooty()
+                ww, wh = _rec_flyout.winfo_width(), _rec_flyout.winfo_height()
+                if not (wx <= e.x_root <= wx+ww and wy <= e.y_root <= wy+wh):
+                    _close_rec_settings()
+            except Exception:
+                pass
+        _flyout_close_bind_id[0] = root.bind("<Button-1>", _on_click, add="+")
+    root.after(150, _bind_close)
+
+_rec_gear_btn = ctk.CTkButton(_rec_row1, text="⚙", command=_toggle_settings_flyout,
+    fg_color="transparent", hover_color=C["surface"],
+    text_color=C["muted"], width=28, height=24, corner_radius=4,
+    font=("Segoe UI", 12), border_width=0)
+_rec_gear_btn.pack(side="right", padx=(0, 2))
+tip(_rec_gear_btn, "Recording settings")
+
+# — Row 2: step count + feedback —
+_rec_row2 = ctk.CTkFrame(rec_panel, height=28, corner_radius=0, fg_color=C["bg"])
+_rec_row2.pack(fill="x")
+_rec_row2.pack_propagate(False)
+
+_rec_steps = ctk.CTkLabel(_rec_row2, text="0",
+    font=("Courier New", 10, "bold"), text_color=C["accent"], width=28)
+_rec_steps.pack(side="left", padx=(10, 0))
+
+_rec_cap_step = ctk.CTkLabel(_rec_row2, text="",
+    font=("Segoe UI", 9), text_color="#555", anchor="w")
+_rec_cap_step.pack(side="left", padx=(2, 0))
+
+_rec_cap_input = ctk.CTkLabel(_rec_row2, text="",
+    font=("Segoe UI", 9, "bold"), text_color="#555", anchor="w")
+_rec_cap_input.pack(side="left", padx=(2, 0))
+
+_rec_cap_rest = ctk.CTkLabel(_rec_row2, text="",
+    font=("Segoe UI", 9), text_color="#444", anchor="w")
+_rec_cap_rest.pack(side="left", padx=(2, 0))
+
+_rec_project = ctk.CTkLabel(_rec_row2, text="",
+    font=("Segoe UI", 9), text_color="#444")
+_rec_project.pack(side="right", padx=(0, 10))
+
+# ── Dragging — bind_all with event filter for reliability ──
+_rec_drag = {"x": 0, "y": 0, "active": False}
+
+_REC_INTERACTIVE = (ctk.CTkButton, ctk.CTkCheckBox, ctk.CTkOptionMenu,
+                    ctk.CTkEntry, ctk.CTkTextbox, ctk.CTkSwitch)
+
+def _is_rec_interactive(widget):
+    """Walk up from widget to rec_panel; return True if any ancestor is interactive."""
+    w = widget
+    while w:
+        if isinstance(w, _REC_INTERACTIVE):
+            return True
+        if w == rec_panel:
+            return False
+        w = getattr(w, 'master', None)
+    return True  # outside rec_panel — don't drag
+
+def _rec_press(e):
+    if not rec_panel.winfo_ismapped():
+        return
+    if _is_rec_interactive(e.widget):
+        return
+    _rec_drag["x"] = e.x_root - root.winfo_x()
+    _rec_drag["y"] = e.y_root - root.winfo_y()
+    _rec_drag["active"] = True
+
+def _rec_motion(e):
+    if _rec_drag["active"] and rec_panel.winfo_ismapped():
+        root.geometry(f"+{e.x_root - _rec_drag['x']}+{e.y_root - _rec_drag['y']}")
+
+def _rec_release(e):
+    _rec_drag["active"] = False
+
+root.bind("<ButtonPress-1>", _rec_press, add="+")
+root.bind("<B1-Motion>", _rec_motion, add="+")
+root.bind("<ButtonRelease-1>", _rec_release, add="+")
 
 
 def _toggle_pause():
@@ -3143,25 +3523,31 @@ def _toggle_pause():
 def _update_rec_panel():
     _rec_project.configure(text=project_name or "Untitled")
     count = len(log_data)
-    _rec_steps.configure(text=f"{count} step{'s' if count != 1 else ''}")
+    _rec_steps.configure(text=str(count))
     if paused:
-        _rec_status.configure(text="⏸  PAUSED", text_color=C["warn"])
+        _rec_status.configure(text="⏸", text_color=C["warn"])
         _btn_pause.configure(text="▶", border_color=C["warn"])
     elif recording:
-        _rec_status.configure(text="● RECORDING", text_color=C["danger"])
+        _rec_status.configure(text="●", text_color=C["danger"])
         _btn_pause.configure(text="⏸", border_color=C["border"])
     else:
-        _rec_status.configure(text="◼  Ready", text_color=C["muted"])
+        _rec_status.configure(text="◼", text_color=C["muted"])
         _btn_pause.configure(text="⏸", border_color=C["border"])
-    for i, lbl in enumerate(_rec_log_labels):
-        idx = len(_rec_log) - 1 - i
-        if idx >= 0:
-            sn, desc = _rec_log[idx]
-            lbl.configure(
-                text=f"↳ {sn}  {desc}",
-                text_color=C["text"] if i == 0 else C["muted"])
-        else:
-            lbl.configure(text="")
+    # Build compact capture-mode indicator
+    modes = []
+    if capture_on_click:  modes.append("🖱")
+    if capture_keyboard:  modes.append("⌨")
+    if capture_on_hotkey: modes.append("⎙")
+    _rec_mode_label.configure(text=" ".join(modes) if modes else "—")
+    step_num, kw, rest, cap_color = _last_capture[0]
+    if kw:
+        _rec_cap_step.configure(text=f"↳ {step_num}")
+        _rec_cap_input.configure(text=kw, text_color=cap_color or C["text"])
+        _rec_cap_rest.configure(text=rest)
+    else:
+        _rec_cap_step.configure(text="")
+        _rec_cap_input.configure(text="")
+        _rec_cap_rest.configure(text="")
 
 
 # ══════════════════════════════════════ HOME PANEL ══════════════════════════════════════
@@ -3209,7 +3595,7 @@ def _open_recent(folder):
 def _refresh_home():
     if _home_recents_inner[0]:
         try: _home_recents_inner[0].destroy()
-        except: pass
+        except Exception: pass
 
     container = ctk.CTkFrame(_home_center, fg_color="transparent")
     container.pack(pady=(20, 0))
@@ -3246,7 +3632,7 @@ def _refresh_home():
         return
 
     ctk.CTkLabel(container, text="RECENT",
-        font=("Segoe UI", 8, "bold"), text_color=C["muted"]
+        font=("Segoe UI", 9, "bold"), text_color=C["muted"]
     ).pack(anchor="w", pady=(0, 4))
 
     for i, (mtime, pname, nsteps, folder) in enumerate(recent):
@@ -3293,9 +3679,14 @@ def _refresh_home():
 
 # ══════════════════════════════════════ PANEL SWITCHING ══════════════════════════════════════
 
+def _close_rec_flyout():
+    _close_rec_settings()
+
 def show_home():
+    _close_rec_flyout()
     rec_panel.pack_forget()
     edit_panel.pack_forget()
+    root.overrideredirect(False)
     _refresh_home()
     home_panel.pack(fill="both", expand=True)
     root.geometry("700x520")
@@ -3314,16 +3705,19 @@ def show_recording():
     _update_rec_panel()
     rec_panel.pack(fill="both", expand=True)
     sw = root.winfo_screenwidth()
-    root.geometry(f"460x172+{sw - 472}+8")
-    root.minsize(460, 172)
-    root.resizable(False, False)
+    root.overrideredirect(True)
+    w = 280
+    root.geometry(f"{w}x64+{(sw - w) // 2}+8")
+    root.minsize(220, 64)
+    root.resizable(True, False)
     root.attributes("-topmost", True)
-    root.title(f"PSR Pro · {project_name or 'Recording'}")
 
 
 def show_editing():
+    _close_rec_flyout()
     home_panel.pack_forget()
     rec_panel.pack_forget()
+    root.overrideredirect(False)
     edit_panel.pack(fill="both", expand=True)
     root.geometry("1500x900")
     root.minsize(960, 640)
@@ -3336,39 +3730,40 @@ def show_editing():
     # Stop is only relevant if recording is still running (opened from tray)
     if recording:
         btn_stop.pack(side="left", padx=3, pady=9)
-        btn_tray.pack(side="left", padx=(6, 3), pady=11)
     else:
         btn_stop.pack_forget()
-        btn_tray.pack_forget()
     # Re-apply view mode so tab states (Edit hidden/shown, tool strip) are correct.
     _set_view_mode(view_mode)
 
 
 # ══════════════════════════════════════ KEYBOARD SHORTCUTS ══════════════════════════
 
+_TEXT_FOCUS_CLASSES = ("Text", "Entry", "TEntry", "Spinbox", "TSpinbox")
+
+def _focus_in_text_input():
+    """True if keyboard focus is in a text/entry widget (don't steal shortcuts)."""
+    focus = root.focus_get()
+    return focus and focus.winfo_class() in _TEXT_FOCUS_CLASSES
+
+
 def _on_root_key(event):
     if event.keysym in ("Delete", "BackSpace"):
-        focus = root.focus_get()
-        # If focus is in a text field, let normal delete work
-        if focus and focus.winfo_class() in ("Text", "Entry", "TEntry"):
+        if _focus_in_text_input():
             return
-        # Multi-step delete takes priority when steps are selected
+        # Annotation delete takes priority over step delete
+        card = active_card_ref[0]
+        if (card is not None and not card.is_text_only
+                and hasattr(card, '_selected_obj') and card._selected_obj is not None):
+            card.delete_selected()
+            return "break"
         if _selected:
             _delete_selected()
-            return "break"
-        # Fallback: delete annotation object in active card
-        card = active_card_ref[0]
-        if card is not None and not card.is_text_only:
-            card.delete_selected()
             return "break"
 
 
 def _on_tool_hotkey(event):
-    focus = root.focus_get()
-    if focus:
-        wclass = focus.winfo_class()
-        if wclass in ('Text', 'Entry', 'TEntry', 'Spinbox', 'TSpinbox'):
-            return
+    if _focus_in_text_input():
+        return
     _TOOL_KEYS = {'v': 'none', 'u': 'highlight', 'm': 'redact', 'c': 'crop', 'b': 'draw'}
     tool = _TOOL_KEYS.get(event.char.lower())
     if tool:
@@ -3377,21 +3772,28 @@ def _on_tool_hotkey(event):
 
 
 def _on_undo(event=None):
-    focus = root.focus_get()
-    if focus:
-        wclass = focus.winfo_class()
-        if wclass in ('Text', 'Entry', 'TEntry', 'Spinbox', 'TSpinbox'):
-            return
+    if _focus_in_text_input():
+        return
     card = active_card_ref[0]
     if card is not None and not card.is_text_only:
         card._undo()
         return "break"
 
 
+def _on_map(event):
+    """Fired when the window becomes visible again (e.g. restored from taskbar)."""
+    if _rec_minimized[0] and recording:
+        root.after(50, _restore_rec_tray)
+
+root.bind("<Map>", _on_map)
 root.bind("<Delete>",    _on_root_key)
 root.bind("<BackSpace>", _on_root_key)
 root.bind("<Control-v>", _handle_paste)
 root.bind("<Control-z>", _on_undo)
+root.bind("<Control-o>", lambda e: load_recording())
+root.bind("<Control-O>", lambda e: load_recording())
+root.bind("<Control-Shift-H>", lambda e: export_html())
+root.bind("<Control-Shift-P>", lambda e: export_pdf())
 for _hk in ('v', 'u', 'm', 'c', 'b'):
     root.bind(f"<KeyPress-{_hk}>", _on_tool_hotkey)
     root.bind(f"<KeyPress-{_hk.upper()}>", _on_tool_hotkey)
