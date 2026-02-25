@@ -2464,9 +2464,13 @@ def _apply_project_name():
 
 # ══════════════════════════════════════ RECORDING ACTIONS ══════════════════════════════════════
 
+def _default_recording_name():
+    return datetime.now().strftime("Recording %Y-%m-%d %H:%M")
+
+
 def _prompt_new_recording():
     """Combined dialog: project name + save location. Returns (name, parent_dir) or None."""
-    ts_default   = datetime.now().strftime("Recording %Y-%m-%d %H:%M")
+    ts_default   = _default_recording_name()
     default_path = os.path.abspath(BASE_DIR)
 
     dlg = ctk.CTkToplevel(root)
@@ -2554,14 +2558,35 @@ def _prompt_new_recording():
     return result[0]
 
 
-def start_recording():
+def _get_new_recording_settings(name_override=None, parent_dir_override=None):
+    """Resolve and normalize recording settings from UI and optional overrides."""
+    default_name = _default_recording_name()
+    default_path = os.path.abspath(BASE_DIR)
+
+    name = (name_override if name_override is not None else project_name_var.get()).strip()
+    parent_dir = (parent_dir_override if parent_dir_override is not None else save_parent_dir_var.get()).strip()
+
+    if not name:
+        name = default_name
+    if not parent_dir:
+        parent_dir = default_path
+
+    return name, parent_dir
+
+
+def start_recording(name_override=None, parent_dir_override=None):
     global recording, step_counter, log_data, project_name
-    res = _prompt_new_recording()
-    if res is None:
+    name, parent_dir = _get_new_recording_settings(name_override, parent_dir_override)
+
+    try:
+        os.makedirs(parent_dir, exist_ok=True)
+    except OSError as exc:
+        messagebox.showerror("Cannot create folder", f"Save location is not writable:\n{parent_dir}\n\n{exc}")
         return
-    name, parent_dir = res
+
     project_name = name
     project_name_var.set(project_name)
+    save_parent_dir_var.set(parent_dir)
 
     _selected.clear()
     _last_capture[0] = ("", "", "", None)
@@ -3013,7 +3038,7 @@ _cap_hotkey_var.trace_add("write", _sync_globals)
 ctk.CTkFrame(toolbar, width=1, fg_color=C["border"]).pack(side="left", fill="y", pady=8, padx=(10,6))
 ctk.CTkLabel(toolbar, text="Project:", font=("Segoe UI", 9),
              text_color=C["muted"]).pack(side="left", padx=(0,3))
-project_name_var = tk.StringVar(value="")
+project_name_var = tk.StringVar(value=_default_recording_name())
 project_name_entry = ctk.CTkEntry(
     toolbar, textvariable=project_name_var,
     placeholder_text="Untitled recording",
@@ -3570,6 +3595,47 @@ _home_center.place(relx=0.5, rely=0.5, anchor="center")
 
 _home_actions = ctk.CTkFrame(_home_center, fg_color="transparent")
 _home_actions.pack()
+
+_home_new_project = ctk.CTkFrame(_home_center, fg_color="transparent")
+_home_new_project.pack(fill="x", padx=8, pady=(0, 12))
+
+ctk.CTkLabel(_home_new_project, text="Project Name",
+    font=("Segoe UI", 13, "bold"), text_color=C["text"]
+).pack(anchor="w")
+
+ctk.CTkEntry(_home_new_project, textvariable=project_name_var,
+    placeholder_text="Recording name (optional)",
+    width=420, height=34, corner_radius=6,
+    fg_color=C["surface"], border_width=1, border_color=C["border"],
+    font=("Segoe UI", 11), text_color=C["text"]
+).pack(anchor="w", pady=(6, 10))
+
+ctk.CTkLabel(_home_new_project, text="Save to",
+    font=("Segoe UI", 10), text_color=C["muted"]
+).pack(anchor="w")
+
+_home_save_row = ctk.CTkFrame(_home_new_project, fg_color="transparent")
+_home_save_row.pack(fill="x", pady=(5, 0))
+
+save_parent_dir_var = tk.StringVar(value=os.path.abspath(BASE_DIR))
+_home_save_entry = ctk.CTkEntry(_home_save_row, textvariable=save_parent_dir_var,
+    width=330, height=32, corner_radius=6,
+    fg_color=C["surface"], border_width=1, border_color=C["border"],
+    font=("Segoe UI", 10), text_color=C["muted"], state="readonly")
+_home_save_entry.pack(side="left")
+
+def _browse_home_save_dir():
+    folder = filedialog.askdirectory(initialdir=save_parent_dir_var.get(), title="Choose folder")
+    if folder:
+        save_parent_dir_var.set(folder)
+
+ctk.CTkButton(_home_save_row, text="Browse...",
+    command=_browse_home_save_dir,
+    fg_color=C["surface"], hover_color="#333", border_width=1,
+    border_color=C["border"], text_color=C["text"],
+    width=84, height=32, corner_radius=6,
+    font=("Segoe UI", 10)
+).pack(side="left", padx=(8, 0))
 
 ctk.CTkButton(_home_actions, text="▶  Start New Recording",
     fg_color=C["success"], hover_color="#1d7a43",
