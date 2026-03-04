@@ -8,9 +8,29 @@ Dependencies:
     pip install customtkinter pillow mss pynput pygetwindow fpdf2
     pip install tkinterdnd2          # optional: enables drag-and-drop
 """
+from __future__ import annotations
 
-import copy, html as _html, io, math, os, re, json, queue, struct, subprocess, sys, time, threading, wave, base64, webbrowser
+import copy
+import html as _html
+import io
+import json
+import logging
+import math
+import os
+import queue
+import re
+import struct
+import subprocess
+import sys
+import threading
+import time
+import wave
+import base64
+import webbrowser
 from datetime import datetime
+
+logging.basicConfig(level=logging.INFO, format="%(levelname)s [%(name)s] %(message)s")
+log = logging.getLogger(__name__)
 
 try:
     import winsound
@@ -37,34 +57,11 @@ try:
 except ImportError:
     _HAS_DND = False
 
-
-# ══════════════════════════════════════ THEME ══════════════════════════════════════
+from psr_constants import C, CARD_IMG_MAX_W, HANDLE_SZ, HANDLE_HIT, BASE_DIR, CAPTURE_MAX_W, DEFAULT_IMG_SIZE
 
 ctk.set_appearance_mode("dark")
 ctk.set_default_color_theme("blue")
-
-C = {
-    "bg":       "#111111",
-    "panel":    "#1a1a1a",
-    "surface":  "#222222",
-    "card":     "#1e1e1e",
-    "border":   "#2c2c2c",
-    "accent":   "#3d8ef0",
-    "acc_dark": "#2a6cbf",
-    "danger":   "#c0392b",
-    "success":  "#27ae60",
-    "warn":     "#e67e22",
-    "text":     "#e4e4e4",
-    "muted":    "#777777",
-    "crop_col": "#f0c040",
-}
-
-CARD_IMG_MAX_W = 860
-HANDLE_SZ      = 6
-HANDLE_HIT     = 9
-BASE_DIR = "recordings"
 os.makedirs(BASE_DIR, exist_ok=True)
-CAPTURE_MAX_W = 1920
 
 
 # ══════════════════════════════════════ GLOBALS ══════════════════════════════════════
@@ -101,53 +98,37 @@ capture_delay_ms  = 100     # ms to wait before taking screenshot (lets menus/ho
 capture_format    = "jpg"   # "jpg" (fast, smaller) or "png" (lossless)
 _last_capture     = [("", "", "", None)]  # (step, keyword, rest, color)
 
-def _rec_settings_path():
-    if getattr(sys, "frozen", False):
-        base = os.path.dirname(sys.executable)
-    else:
-        base = os.path.dirname(os.path.abspath(__file__))
-    return os.path.join(base, "psr_pro_settings.json")
+from psr_settings import load_settings, save_settings as _save_settings_io
 
-def _load_recording_settings():
+def _load_recording_settings() -> None:
     global capture_on_click, capture_on_hotkey, capture_keyboard, ignore_psr_focus, capture_delay_ms, capture_format
-    path = _rec_settings_path()
-    if not os.path.isfile(path):
+    data = load_settings()
+    if not data:
         return
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        if data.get("capture_on_click") is not None:
-            capture_on_click = bool(data["capture_on_click"])
-        if data.get("capture_on_hotkey") is not None:
-            capture_on_hotkey = bool(data["capture_on_hotkey"])
-        if data.get("capture_keyboard") is not None:
-            capture_keyboard = bool(data["capture_keyboard"])
-        if data.get("ignore_psr_focus") is not None:
-            ignore_psr_focus = bool(data["ignore_psr_focus"])
-        if data.get("capture_delay_ms") is not None:
-            capture_delay_ms = max(0, min(2000, int(data["capture_delay_ms"])))
-        if data.get("capture_format") in ("jpg", "png"):
-            capture_format = data["capture_format"]
-    except Exception:
-        pass
+    if data.get("capture_on_click") is not None:
+        capture_on_click = bool(data["capture_on_click"])
+    if data.get("capture_on_hotkey") is not None:
+        capture_on_hotkey = bool(data["capture_on_hotkey"])
+    if data.get("capture_keyboard") is not None:
+        capture_keyboard = bool(data["capture_keyboard"])
+    if data.get("ignore_psr_focus") is not None:
+        ignore_psr_focus = bool(data["ignore_psr_focus"])
+    if data.get("capture_delay_ms") is not None:
+        capture_delay_ms = max(0, min(2000, int(data["capture_delay_ms"])))
+    if data.get("capture_format") in ("jpg", "png"):
+        capture_format = data["capture_format"]
 
 _load_recording_settings()
 
-def _save_recording_settings():
-    try:
-        path = _rec_settings_path()
-        data = {
-            "capture_on_click":  capture_on_click,
-            "capture_on_hotkey": capture_on_hotkey,
-            "capture_keyboard":  capture_keyboard,
-            "ignore_psr_focus":  ignore_psr_focus,
-            "capture_delay_ms":  capture_delay_ms,
-            "capture_format":    capture_format,
-        }
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=2)
-    except Exception:
-        pass
+def _save_recording_settings() -> None:
+    _save_settings_io({
+        "capture_on_click":  capture_on_click,
+        "capture_on_hotkey": capture_on_hotkey,
+        "capture_keyboard":  capture_keyboard,
+        "ignore_psr_focus":  ignore_psr_focus,
+        "capture_delay_ms":  capture_delay_ms,
+        "capture_format":    capture_format,
+    })
 
 draw_color      = "#e74c3c"
 draw_width      = 3
@@ -244,7 +225,7 @@ def _obj_bbox_img(obj):
     return min(xs), min(ys), max(xs), max(ys)
 
 
-def _get_crop(step_index, img_size=None):
+def _get_crop(step_index: int, img_size: tuple[int, int] | None = None) -> tuple[int, int, int, int]:
     """Return (x1,y1,x2,y2) crop region in original image space, or full image."""
     crop = step_crops.get(step_index)
     if crop:
@@ -257,7 +238,7 @@ def _get_crop(step_index, img_size=None):
     return 0, 0, img.size[0], img.size[1]
 
 
-def _pdf_safe(text):
+def _pdf_safe(text: str) -> str:
     """Make text safe for PDF built-in fonts (latin-1 subset)."""
     replacements = {
         '\u2018': "'", '\u2019': "'", '\u201c': '"', '\u201d': '"',
@@ -268,7 +249,7 @@ def _pdf_safe(text):
     return text.encode('latin-1', errors='replace').decode('latin-1')
 
 
-def _open_folder(filepath):
+def _open_folder(filepath: str) -> None:
     """Open the folder containing filepath in the OS file manager."""
     folder = os.path.dirname(os.path.abspath(filepath))
     try:
@@ -279,10 +260,10 @@ def _open_folder(filepath):
         else:
             subprocess.Popen(["xdg-open", folder])
     except Exception as e:
-        print(f"[PSR] Could not open folder: {e}")
+        log.warning("Could not open folder: %s", e)
 
 
-def _flatten_to_pil(step_index):
+def _flatten_to_pil(step_index: int) -> Image.Image | None:
     """Composite crop + all vector objects onto screenshot. Returns a flat RGB PIL image, or None for text-only / missing."""
     entry = log_data[step_index]
     if entry.get("screenshot") is None:
@@ -339,14 +320,14 @@ def _flatten_to_pil(step_index):
 
 # ══════════════════════════════════════ SESSION ══════════════════════════════════════
 
-def _safe_folder_name(name):
+def _safe_folder_name(name: str) -> str:
     """Sanitize a string for use as a folder name."""
     name = re.sub(r'[<>:"/\\|?*]', '_', name.strip())
     name = name.strip('. ')
     return name[:80] if name else ""
 
 
-def create_session(parent_dir=None):
+def create_session(parent_dir: str | None = None) -> None:
     """Create the session folder. parent_dir: where to create it (default BASE_DIR)."""
     global current_session
     base = (parent_dir if parent_dir is not None else BASE_DIR)
@@ -360,7 +341,7 @@ def create_session(parent_dir=None):
     os.makedirs(current_session)
 
 
-def save_steps():
+def save_steps() -> None:
     if not current_session:
         return
     if not os.path.isdir(current_session):
@@ -381,10 +362,11 @@ def save_steps():
         with open(os.path.join(current_session, "steps.json"), "w", encoding="utf-8") as f:
             json.dump(doc, f, indent=4)
     except OSError as exc:
+        log.exception("Save steps failed: %s", exc)
         _set_status(f"⚠ Save failed: {exc}", C["danger"])
 
 
-def capture_screenshot(filename):
+def capture_screenshot(filename: str) -> str:
     filepath = os.path.join(current_session, filename)
     with mss.mss() as sct:
         shot = sct.grab(sct.monitors[1])
@@ -402,7 +384,7 @@ def capture_screenshot(filename):
     return out
 
 
-def get_active_window():
+def get_active_window() -> str:
     if not _HAS_GW:
         return "Unknown"
     try:
@@ -414,6 +396,7 @@ def get_active_window():
 
 # ── Capture flash + camera click SFX ─────────────────────────────────────────────────────
 _CAPTURE_FLASH_MS = 280
+_SOUND_CLEANUP_MS = 400  # delay before removing temp WAV (after async play)
 _FLASH_TRANSPARENT = "#010101"  # invisible with -transparentcolor
 _camera_click_wav = None
 
@@ -458,7 +441,7 @@ def _play_capture_sound():
                         os.remove(p)
                 except Exception:
                     pass
-            root.after(400, lambda p=path: _cleanup(p))
+            root.after(_SOUND_CLEANUP_MS, lambda p=path: _cleanup(p))
         finally:
             if fd is not None:
                 try:
@@ -512,7 +495,7 @@ def _show_capture_flash():
 
 # ══════════════════════════════════════ STEP HANDLING ══════════════════════════════════════
 
-def handle_event(event_text):
+def handle_event(event_text: str) -> None:
     global step_counter
     if not recording or not current_session:
         return
@@ -522,7 +505,7 @@ def handle_event(event_text):
     try:
         capture_screenshot(filename)
     except Exception as exc:
-        print(f"[PSR] Screenshot error: {exc}")
+        log.exception("Screenshot capture failed: %s", exc)
         return
     _play_capture_sound()
     root.after(0, _show_capture_flash)
@@ -1017,7 +1000,7 @@ def _setup_dnd():
             f'bind {target_w} <<Drop:DND_Files>> '
             f'{{set ::_psr_drop_data %D; {cmd}}}')
     except Exception as e:
-        print(f"[PSR] DnD setup failed: {e}")
+        log.warning("DnD setup failed: %s", e)
 
 
 # ══════════════════════════════════════ DESC AUTO-SAVE ══════════════════════════════════════
@@ -1138,8 +1121,8 @@ class StepCard(BaseCard):
         self.index        = index
         self.is_text_only = log_data[index].get("screenshot") is None
         self._disp_size   = (CARD_IMG_MAX_W, 100)
-        self._orig_size   = (1920, 1080)
-        self._crop_region = (0, 0, 1920, 1080)
+        self._orig_size   = DEFAULT_IMG_SIZE
+        self._crop_region = (0, 0, *DEFAULT_IMG_SIZE)
         self._photo       = None
         self.canvas        = None
         self._folded      = False
@@ -3059,6 +3042,7 @@ document.getElementById('deck').addEventListener('click',e=>{{
 </script>
 </body></html>""")
     except Exception as exc:
+        log.exception("HTML export failed: %s", exc)
         messagebox.showerror("HTML Export Error", f"Failed to export HTML:\n{exc}")
         return
 
@@ -3109,6 +3093,7 @@ def export_pdf():
 
         pdf.output(report_path)
     except Exception as exc:
+        log.exception("PDF export failed: %s", exc)
         messagebox.showerror("PDF Export Error", f"Failed to export PDF:\n{exc}")
         return
     finally:
