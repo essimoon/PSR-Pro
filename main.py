@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
-"""
-PSR Pro v4 — Professional Process Step Recorder
+"""PSR Pro v4 — Professional Process Step Recorder
 Non-destructive crop · Insert custom steps · Project naming
 Vector annotation layer · Selectable objects with transform gizmo
 Mouse-up screenshot capture · Per-step undo · Continue recording
@@ -10,8 +9,13 @@ Dependencies:
     pip install tkinterdnd2          # optional: enables drag-and-drop
 """
 
-import copy, html as _html, io, os, re, json, queue, subprocess, sys, time, threading, base64, webbrowser
+import copy, html as _html, io, math, os, re, json, queue, struct, subprocess, sys, time, threading, wave, base64, webbrowser
 from datetime import datetime
+
+try:
+    import winsound
+except ImportError:
+    winsound = None
 
 import tkinter as tk
 from tkinter import filedialog, messagebox
@@ -58,12 +62,12 @@ C = {
 CARD_IMG_MAX_W = 860
 HANDLE_SZ      = 6
 HANDLE_HIT     = 9
+BASE_DIR = "recordings"
+os.makedirs(BASE_DIR, exist_ok=True)
+CAPTURE_MAX_W = 1920
 
 
 # ══════════════════════════════════════ GLOBALS ══════════════════════════════════════
-
-BASE_DIR = "recordings"
-os.makedirs(BASE_DIR, exist_ok=True)
 
 recording         = False
 current_session   = None
@@ -96,6 +100,55 @@ paused            = False   # recording is running but events are suppressed
 capture_delay_ms  = 100     # ms to wait before taking screenshot (lets menus/hovers render)
 capture_format    = "jpg"   # "jpg" (fast, smaller) or "png" (lossless)
 _last_capture     = [("", "", "", None)]  # (step, keyword, rest, color)
+
+def _rec_settings_path():
+    if getattr(sys, "frozen", False):
+        base = os.path.dirname(sys.executable)
+    else:
+        base = os.path.dirname(os.path.abspath(__file__))
+    return os.path.join(base, "psr_pro_settings.json")
+
+def _load_recording_settings():
+    global capture_on_click, capture_on_hotkey, capture_keyboard, ignore_psr_focus, capture_delay_ms, capture_format
+    path = _rec_settings_path()
+    if not os.path.isfile(path):
+        return
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if data.get("capture_on_click") is not None:
+            capture_on_click = bool(data["capture_on_click"])
+        if data.get("capture_on_hotkey") is not None:
+            capture_on_hotkey = bool(data["capture_on_hotkey"])
+        if data.get("capture_keyboard") is not None:
+            capture_keyboard = bool(data["capture_keyboard"])
+        if data.get("ignore_psr_focus") is not None:
+            ignore_psr_focus = bool(data["ignore_psr_focus"])
+        if data.get("capture_delay_ms") is not None:
+            capture_delay_ms = max(0, min(2000, int(data["capture_delay_ms"])))
+        if data.get("capture_format") in ("jpg", "png"):
+            capture_format = data["capture_format"]
+    except Exception:
+        pass
+
+_load_recording_settings()
+
+def _save_recording_settings():
+    try:
+        path = _rec_settings_path()
+        data = {
+            "capture_on_click":  capture_on_click,
+            "capture_on_hotkey": capture_on_hotkey,
+            "capture_keyboard":  capture_keyboard,
+            "ignore_psr_focus":  ignore_psr_focus,
+            "capture_delay_ms":  capture_delay_ms,
+            "capture_format":    capture_format,
+        }
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
+    except Exception:
+        pass
+
 draw_color      = "#e74c3c"
 draw_width      = 3
 
@@ -331,8 +384,6 @@ def save_steps():
         _set_status(f"⚠ Save failed: {exc}", C["danger"])
 
 
-CAPTURE_MAX_W = 1920  # cap screenshot width — matches Windows Steps Recorder behaviour
-
 def capture_screenshot(filename):
     filepath = os.path.join(current_session, filename)
     with mss.mss() as sct:
@@ -361,6 +412,104 @@ def get_active_window():
         return "Unknown"
 
 
+# ── Capture flash + camera click SFX ─────────────────────────────────────────────────────
+_CAPTURE_FLASH_MS = 280
+_FLASH_TRANSPARENT = "#010101"  # invisible with -transparentcolor
+_camera_click_wav = None
+
+def _make_camera_click_wav():
+    """Generate a short camera-shutter style click (damped sine) as WAV bytes."""
+    rate = 44100
+    duration = 0.1
+    freq = 1600
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as wav:
+        wav.setnchannels(1)
+        wav.setsampwidth(2)
+        wav.setframerate(rate)
+        n = int(rate * duration)
+        for i in range(n):
+            t = i / rate
+            amp = 0.85 * math.exp(-t * 50) * math.sin(2 * math.pi * freq * t)
+            sample = max(-32767, min(32767, int(32767 * amp)))
+            wav.writeframes(struct.pack("<h", sample))
+    buf.seek(0)
+    return buf.read()
+
+def _play_capture_sound():
+    if winsound is None:
+        return
+    global _camera_click_wav
+    try:
+        if _camera_click_wav is None:
+            _camera_click_wav = _make_camera_click_wav()
+        # Play from temp file; SND_MEMORY is unreliable on some Windows setups
+        fd, path = None, None
+        try:
+            import tempfile
+            fd, path = tempfile.mkstemp(suffix=".wav", prefix="psr_click_")
+            os.write(fd, _camera_click_wav)
+            os.close(fd)
+            fd = None
+            winsound.PlaySound(path, winsound.SND_FILENAME | winsound.SND_ASYNC | winsound.SND_NODEFAULT)
+            def _cleanup(p):
+                try:
+                    if p and os.path.exists(p):
+                        os.remove(p)
+                except Exception:
+                    pass
+            root.after(400, lambda p=path: _cleanup(p))
+        finally:
+            if fd is not None:
+                try:
+                    os.close(fd)
+                except Exception:
+                    pass
+    except Exception:
+        try:
+            winsound.MessageBeep(winsound.MB_OK)
+        except Exception:
+            pass
+
+def _show_capture_flash():
+    # Use mss virtual screen (all monitors) so overlay matches real pixel bounds
+    try:
+        with mss.mss() as sct:
+            virt = sct.monitors[0]  # combined bounding box of all monitors
+            x, y = virt["left"], virt["top"]
+            w, h = virt["width"], virt["height"]
+    except Exception:
+        return
+    win = tk.Toplevel(root)
+    win.overrideredirect(True)
+    win.attributes("-topmost", True)
+    win.attributes("-alpha", 0.0)
+    win.attributes("-transparentcolor", _FLASH_TRANSPARENT)
+    win.geometry(f"{w}x{h}+{x}+{y}")
+    win.configure(bg=_FLASH_TRANSPARENT)
+    canvas = tk.Canvas(win, width=w, height=h, bg=_FLASH_TRANSPARENT, highlightthickness=0)
+    canvas.pack(fill="both", expand=True)
+    inset = 3
+    canvas.create_rectangle(inset, inset, w - inset, h - inset, outline=C["accent"], width=4)
+    # (delay_ms_until_next_step, alpha) — total _CAPTURE_FLASH_MS
+    steps = [(60, 0.7), (60, 0.9), (80, 0.5), (_CAPTURE_FLASH_MS - 200, 0.0)]
+    step_idx = [0]
+
+    def tick():
+        delay, alpha = steps[step_idx[0]]
+        step_idx[0] += 1
+        try:
+            win.attributes("-alpha", alpha)
+        except Exception:
+            pass
+        if step_idx[0] < len(steps):
+            win.after(delay, tick)
+        else:
+            win.after(delay, lambda: (win.destroy() if win.winfo_exists() else None))
+
+    win.after(0, tick)
+
+
 # ══════════════════════════════════════ STEP HANDLING ══════════════════════════════════════
 
 def handle_event(event_text):
@@ -375,6 +524,8 @@ def handle_event(event_text):
     except Exception as exc:
         print(f"[PSR] Screenshot error: {exc}")
         return
+    _play_capture_sound()
+    root.after(0, _show_capture_flash)
     window = get_active_window()
     entry  = {
         "step":        step_counter,
@@ -3023,8 +3174,8 @@ tip(btn_stop, "Stop recording  [F6]")
 
 
 # Capture mode vars (shared with recording tray — no widgets in toolbar)
-_cap_click_var  = tk.BooleanVar(value=True)
-_cap_hotkey_var = tk.BooleanVar(value=False)
+_cap_click_var  = tk.BooleanVar(value=capture_on_click)
+_cap_hotkey_var = tk.BooleanVar(value=capture_on_hotkey)
 
 def _sync_globals(*_):
     global capture_on_click, capture_on_hotkey
@@ -3355,6 +3506,7 @@ def _close_rec_settings():
         try: _rec_flyout.destroy()
         except Exception: pass
         _rec_flyout = None
+        _save_recording_settings()
     if _flyout_close_bind_id[0]:
         try: root.unbind("<Button-1>", _flyout_close_bind_id[0])
         except Exception: pass
@@ -3745,11 +3897,8 @@ def _refresh_home():
 
 # ══════════════════════════════════════ PANEL SWITCHING ══════════════════════════════════════
 
-def _close_rec_flyout():
-    _close_rec_settings()
-
 def show_home():
-    _close_rec_flyout()
+    _close_rec_settings()
     rec_panel.pack_forget()
     edit_panel.pack_forget()
     root.overrideredirect(False)
@@ -3780,7 +3929,7 @@ def show_recording():
 
 
 def show_editing():
-    _close_rec_flyout()
+    _close_rec_settings()
     home_panel.pack_forget()
     rec_panel.pack_forget()
     root.overrideredirect(False)
