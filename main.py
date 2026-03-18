@@ -26,6 +26,7 @@ import threading
 import time
 import wave
 import base64
+import uuid
 import webbrowser
 from datetime import datetime
 
@@ -84,6 +85,12 @@ step_objects: dict = {}
 
 # {step_index: {x1, y1, x2, y2}}  — non-destructive crop in ORIGINAL image space
 step_crops: dict   = {}
+
+# Fold state keyed by step id so it survives delete/reorder
+_card_folded: dict = {}
+
+# Annotations drawn on every screenshot (normalized 0–1 coords). Saved in session as global_overlay.json
+global_annotations: list = []
 
 # {step_index: [json_snapshot, ...]}
 undo_stacks: dict  = {}
@@ -225,6 +232,13 @@ def _obj_bbox_img(obj):
     return min(xs), min(ys), max(xs), max(ys)
 
 
+def _step_id(entry: dict) -> str:
+    """Stable id for a step (for fold state across rebuilds). Assigns id if missing."""
+    if "id" not in entry:
+        entry["id"] = str(uuid.uuid4())
+    return entry["id"]
+
+
 def _get_crop(step_index: int, img_size: tuple[int, int] | None = None) -> tuple[int, int, int, int]:
     """Return (x1,y1,x2,y2) crop region in original image space, or full image."""
     crop = step_crops.get(step_index)
@@ -236,6 +250,86 @@ def _get_crop(step_index: int, img_size: tuple[int, int] | None = None) -> tuple
     img_path = os.path.join(current_session, entry["screenshot"])
     img      = Image.open(img_path)
     return 0, 0, img.size[0], img.size[1]
+
+
+# Max size to decode for card thumbnails (avoids decoding 4K for a 860px-wide card)
+_CARD_DECODE_MAX = 1600
+_CARD_IMAGE_CACHE: dict = {}  # (path, mtime, crop_key) -> (PhotoImage, disp_size, orig_size)
+_CARD_CACHE_MAX = 50
+
+# Background image loading so UI stays responsive
+_card_load_queue: queue.Queue = queue.Queue()
+_card_load_result_queue: queue.Queue = queue.Queue()
+_card_load_pending: set = set()
+
+def _card_load_worker():
+    while True:
+        try:
+            index, img_path, max_w = _card_load_queue.get()
+            if img_path is None:
+                break
+            result = _load_image_fast(img_path, index, max_w)
+            try:
+                mtime = os.path.getmtime(img_path)
+            except OSError:
+                mtime = 0
+            _card_load_result_queue.put((index, img_path, mtime, result))
+        except Exception:
+            log.exception("Card load worker error")
+threading.Thread(target=_card_load_worker, daemon=True).start()
+
+def _load_image_fast(img_path: str, step_index: int, max_disp_w: int) -> tuple[Image.Image, tuple[int,int], tuple[int,int]] | None:
+    """Load image at reduced resolution for card display. Returns (resized_pil, disp_size, orig_size) or None."""
+    if not os.path.exists(img_path):
+        return None
+    try:
+        im = Image.open(img_path)
+        orig_w, orig_h = im.size
+        # JPEG: decode at reduced size (much faster for large screenshots)
+        if getattr(im, "format", "") == "JPEG" and (orig_w > _CARD_DECODE_MAX or orig_h > _CARD_DECODE_MAX):
+            try:
+                im.draft("RGB", (min(_CARD_DECODE_MAX, orig_w), min(_CARD_DECODE_MAX, orig_h)))
+            except Exception:
+                pass
+        im = im.convert("RGB")
+        w, h = im.size
+        cx1, cy1, cx2, cy2 = _get_crop(step_index, (orig_w, orig_h))
+        cx1, cx2 = sorted([cx1, cx2]); cy1, cy2 = sorted([cy1, cy2])
+        if w != orig_w or h != orig_h:
+            sx, sy = w / orig_w, h / orig_h
+            cx1 = int(cx1 * sx); cx2 = int(cx2 * sx)
+            cy1 = int(cy1 * sy); cy2 = int(cy2 * sy)
+        cx1 = max(0, min(cx1, w)); cy1 = max(0, min(cy1, h))
+        cx2 = max(cx1 + 1, min(cx2, w)); cy2 = max(cy1 + 1, min(cy2, h))
+        cropped = im.crop((cx1, cy1, cx2, cy2))
+        cw, ch = cropped.size
+        ratio = min(max_disp_w / cw, 1.0)
+        dw = max(1, int(cw * ratio))
+        dh = max(1, int(ch * ratio))
+        disp_size = (dw, dh)
+        resized = cropped.resize((dw, dh), Image.BILINEAR)
+        return (resized, disp_size, (orig_w, orig_h))
+    except Exception:
+        log.exception("Fast load failed for %s", img_path)
+        return None
+
+
+def _load_thumbnail_fast(img_path: str, max_size: tuple[int, int]) -> Image.Image | None:
+    """Load and thumbnail for list/grid cards (reduced decode for JPEG)."""
+    if not os.path.exists(img_path):
+        return None
+    try:
+        im = Image.open(img_path)
+        if getattr(im, "format", "") == "JPEG" and (im.size[0] > 800 or im.size[1] > 800):
+            try:
+                im.draft("RGB", (min(800, im.size[0]), min(800, im.size[1])))
+            except Exception:
+                pass
+        im = im.convert("RGB")
+        im.thumbnail(max_size, Image.BILINEAR)
+        return im
+    except Exception:
+        return None
 
 
 def _pdf_safe(text: str) -> str:
@@ -285,7 +379,7 @@ def _flatten_to_pil(step_index: int) -> Image.Image | None:
     img = img.crop((cx1, cy1, cx2, cy2))
 
     objects = step_objects.get(step_index, [])
-    if not objects:
+    if not objects and not global_annotations:
         return img
 
     draw_ctx = ImageDraw.Draw(img)
@@ -315,6 +409,26 @@ def _flatten_to_pil(step_index: int) -> Image.Image | None:
             r = w // 2
             for x, y in pts:
                 draw_ctx.ellipse([x-r, y-r, x+r, y+r], fill=rgb)
+
+    # Global overlay (same redaction/highlight on every step, normalized coords)
+    cw, ch = img.size
+    for g in global_annotations:
+        if g.get("type") not in ("highlight", "redact"):
+            continue
+        x1 = int(g["x1_norm"] * cw); y1 = int(g["y1_norm"] * ch)
+        x2 = int(g["x2_norm"] * cw); y2 = int(g["y2_norm"] * ch)
+        x1, x2 = sorted([x1, x2]); y1, y2 = sorted([y1, y2])
+        if g["type"] == "highlight":
+            rgb = _hex_to_rgb(g["color"])
+            for w in range(5, 0, -1):
+                draw_ctx.rectangle([x1, y1, x2, y2], outline=rgb, width=w)
+            ov = Image.new("RGBA", img.size, (0, 0, 0, 0))
+            ImageDraw.Draw(ov).rectangle([x1, y1, x2, y2], fill=(*rgb, 28))
+            img = Image.alpha_composite(img.convert("RGBA"), ov).convert("RGB")
+            draw_ctx = ImageDraw.Draw(img)
+        else:
+            draw_ctx.rectangle([x1, y1, x2, y2], fill=(16, 16, 16))
+            draw_ctx.rectangle([x1, y1, x2, y2], outline=(70, 70, 70), width=2)
     return img
 
 
@@ -329,7 +443,7 @@ def _safe_folder_name(name: str) -> str:
 
 def create_session(parent_dir: str | None = None) -> None:
     """Create the session folder. parent_dir: where to create it (default BASE_DIR)."""
-    global current_session
+    global current_session, global_annotations
     base = (parent_dir if parent_dir is not None else BASE_DIR)
     ts = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
     try:
@@ -339,6 +453,47 @@ def create_session(parent_dir: str | None = None) -> None:
     folder = f"{pname}_{ts}" if pname else ts
     current_session = os.path.join(base, folder)
     os.makedirs(current_session)
+    global_annotations = []
+
+
+def _load_global_overlay() -> None:
+    """Load global_annotations from current_session/global_overlay.json."""
+    global global_annotations
+    global_annotations = []
+    if not current_session or not os.path.isdir(current_session):
+        return
+    path = os.path.join(current_session, "global_overlay.json")
+    if not os.path.exists(path):
+        return
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            global_annotations = json.load(f)
+    except Exception:
+        log.exception("Failed to load global overlay")
+
+
+def _save_global_overlay() -> None:
+    if not current_session or not os.path.isdir(current_session):
+        return
+    path = os.path.join(current_session, "global_overlay.json")
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(global_annotations, f, indent=2)
+    except OSError as exc:
+        log.warning("Save global overlay failed: %s", exc)
+
+
+def _clear_global_overlays() -> None:
+    global global_annotations
+    if not global_annotations:
+        _set_status("No global overlays to clear", C["muted"])
+        return
+    global_annotations = []
+    _save_global_overlay()
+    for card in step_cards:
+        if isinstance(card, StepCard) and card.canvas and hasattr(card, "_render_objects"):
+            card._render_objects()
+    _set_status("Cleared all global overlays", C["success"])
 
 
 def save_steps() -> None:
@@ -514,6 +669,7 @@ def handle_event(event_text: str) -> None:
         "step":        step_counter,
         "description": f"In '{window}', {event_text}",
         "screenshot":  filename,
+        "id":          str(uuid.uuid4()),
     }
     log_data.append(entry)
     step_objects[step_counter - 1] = []
@@ -779,6 +935,7 @@ def insert_custom_step(after_index=None):
         "step":        insert_pos + 1,
         "description": desc,
         "screenshot":  fname,
+        "id":          str(uuid.uuid4()),
     })
     step_objects[insert_pos] = []
 
@@ -815,6 +972,7 @@ def _insert_step_image(src, insert_pos=None, desc=None):
         "step":        insert_pos + 1,
         "description": desc,
         "screenshot":  fname,
+        "id":          str(uuid.uuid4()),
     })
     step_objects[insert_pos] = []
 
@@ -835,6 +993,7 @@ def _insert_step_text(text, insert_pos=None):
         "step":        insert_pos + 1,
         "description": text[:4000],
         "screenshot":  None,
+        "id":          str(uuid.uuid4()),
     })
     step_objects[insert_pos] = []
 
@@ -1082,6 +1241,8 @@ def _delete_selected():
     undo_stacks.clear()
     _selected.clear()
     _renumber_and_rebuild()
+    global step_counter
+    step_counter = len(log_data) + 1  # keep counter in sync for "Continue"
 
 
 def _refresh_card_highlights():
@@ -1125,7 +1286,7 @@ class StepCard(BaseCard):
         self._crop_region = (0, 0, *DEFAULT_IMG_SIZE)
         self._photo       = None
         self.canvas        = None
-        self._folded      = False
+        self._folded      = _card_folded.get(_step_id(log_data[index]), False)
         self._fold_btn    = None
         self._hdr         = None   # kept so we can read its actual height when folding
 
@@ -1143,6 +1304,7 @@ class StepCard(BaseCard):
 
     def _toggle_fold(self):
         self._folded = not self._folded
+        _card_folded[_step_id(log_data[self.index])] = self._folded
         if self._fold_btn:
             self._fold_btn.configure(text="▸" if self._folded else "▾")
         if self._folded:
@@ -1172,6 +1334,16 @@ class StepCard(BaseCard):
         if not self.is_text_only:
             self._build_canvas()
         self._build_desc()
+        if self._folded:
+            if self._fold_btn:
+                self._fold_btn.configure(text="▸")
+            if self.canvas:
+                self.canvas.pack_forget()
+            self.desc_box.pack_forget()
+            self.outer.update_idletasks()
+            hdr_h = self._hdr.winfo_height() if self._hdr else 42
+            self.outer.configure(height=hdr_h)
+            self.outer.pack_propagate(False)
 
     def _build_header(self):
         hdr = ctk.CTkFrame(self.outer, height=42, fg_color=C["surface"], corner_radius=0)
@@ -1271,27 +1443,61 @@ class StepCard(BaseCard):
         img_path = os.path.join(current_session, entry["screenshot"])
         if not os.path.exists(img_path):
             return
-        img = Image.open(img_path).convert("RGB")
-        self._orig_size = img.size
-
-        # Apply crop region in memory only
-        cx1, cy1, cx2, cy2 = _get_crop(self.index, img.size)
-        cx1, cx2 = sorted([cx1, cx2]); cy1, cy2 = sorted([cy1, cy2])
-        cx1 = max(0, min(cx1, img.size[0])); cy1 = max(0, min(cy1, img.size[1]))
-        cx2 = max(cx1+1, min(cx2, img.size[0])); cy2 = max(cy1+1, min(cy2, img.size[1]))
-        self._crop_region = (cx1, cy1, cx2, cy2)
-
-        cropped  = img.crop((cx1, cy1, cx2, cy2))
         try:
             avail_w = self.outer.winfo_width() - 4
         except Exception:
             avail_w = CARD_IMG_MAX_W
-        max_w    = max(CARD_IMG_MAX_W, avail_w) if avail_w > 100 else CARD_IMG_MAX_W
-        ratio    = min(max_w / cropped.size[0], 1.0)
-        dw       = int(cropped.size[0] * ratio)
-        dh       = int(cropped.size[1] * ratio)
-        self._disp_size = (dw, dh)
-        self._photo     = ImageTk.PhotoImage(cropped.resize((dw, dh), Image.LANCZOS))
+        max_w = max(CARD_IMG_MAX_W, avail_w) if avail_w > 100 else CARD_IMG_MAX_W
+        crop_tuple = step_crops.get(self.index)
+        crop_key = (crop_tuple["x1"], crop_tuple["y1"], crop_tuple["x2"], crop_tuple["y2"]) if crop_tuple else ()
+        try:
+            mtime = os.path.getmtime(img_path)
+        except OSError:
+            mtime = 0
+        cache_key = (img_path, mtime, crop_key)
+        cached = _CARD_IMAGE_CACHE.get(cache_key)
+        if cached is not None:
+            self._photo, self._disp_size, self._orig_size = cached
+            self._crop_region = _get_crop(self.index, self._orig_size)
+            cx1, cy1, cx2, cy2 = self._crop_region
+            cx1, cx2 = sorted([cx1, cx2]); cy1, cy2 = sorted([cy1, cy2])
+            self._crop_region = (cx1, cy1, cx2, cy2)
+            dw, dh = self._disp_size
+            self.canvas.configure(width=dw, height=dh)
+            self.canvas.delete("all")
+            self.canvas.create_image(0, 0, anchor="nw", image=self._photo, tags=("bg",))
+            self._render_objects()
+            return
+        result = _load_image_fast(img_path, self.index, max_w)
+        if result is None:
+            return
+        resized_pil, self._disp_size, self._orig_size = result
+        self._crop_region = _get_crop(self.index, self._orig_size)
+        cx1, cy1, cx2, cy2 = self._crop_region
+        cx1, cx2 = sorted([cx1, cx2]); cy1, cy2 = sorted([cy1, cy2])
+        self._crop_region = (cx1, cy1, cx2, cy2)
+        self._photo = ImageTk.PhotoImage(resized_pil)
+        if len(_CARD_IMAGE_CACHE) >= _CARD_CACHE_MAX:
+            # Drop oldest (arbitrary) entry
+            for k in list(_CARD_IMAGE_CACHE)[: _CARD_CACHE_MAX // 2]:
+                _CARD_IMAGE_CACHE.pop(k, None)
+        _CARD_IMAGE_CACHE[cache_key] = (self._photo, self._disp_size, self._orig_size)
+        dw, dh = self._disp_size
+        self.canvas.configure(width=dw, height=dh)
+        self.canvas.delete("all")
+        self.canvas.create_image(0, 0, anchor="nw", image=self._photo, tags=("bg",))
+        self._render_objects()
+
+    def _apply_loaded_image(self, resized_pil: Image.Image, disp_size: tuple[int,int], orig_size: tuple[int,int]) -> None:
+        """Apply a pre-loaded image (from background thread). Call from main thread only."""
+        self._orig_size = orig_size
+        self._crop_region = _get_crop(self.index, orig_size)
+        cx1, cy1, cx2, cy2 = self._crop_region
+        cx1, cx2 = sorted([cx1, cx2]); cy1, cy2 = sorted([cy1, cy2])
+        self._crop_region = (cx1, cy1, cx2, cy2)
+        self._disp_size = disp_size
+        self._photo = ImageTk.PhotoImage(resized_pil)
+        dw, dh = disp_size
         self.canvas.configure(width=dw, height=dh)
         self.canvas.delete("all")
         self.canvas.create_image(0, 0, anchor="nw", image=self._photo, tags=("bg",))
@@ -1304,6 +1510,22 @@ class StepCard(BaseCard):
             self._render_one(i, obj)
         if self._selected_obj is not None and self._selected_obj < len(objects):
             self._draw_gizmo(objects[self._selected_obj])
+        # Global overlay (normalized 0–1 → canvas)
+        dw, dh = self._disp_size
+        for g in global_annotations:
+            if g.get("type") not in ("highlight", "redact"):
+                continue
+            x1c = int(g["x1_norm"] * dw); y1c = int(g["y1_norm"] * dh)
+            x2c = int(g["x2_norm"] * dw); y2c = int(g["y2_norm"] * dh)
+            tag = ("obj", "global")
+            if g["type"] == "highlight":
+                self.canvas.create_rectangle(x1c, y1c, x2c, y2c,
+                    outline=g["color"], width=3, fill="", tags=tag)
+                self.canvas.create_rectangle(x1c+2, y1c+2, x2c-2, y2c-2,
+                    outline="", fill=g["color"], stipple="gray12", tags=tag)
+            else:
+                self.canvas.create_rectangle(x1c, y1c, x2c, y2c,
+                    outline="#555555", width=1, fill="#0a0a0a", tags=tag)
 
     def _render_one(self, i, obj):
         tag = ("obj", f"obj_{i}")
@@ -1588,6 +1810,33 @@ class StepCard(BaseCard):
         else:
             self.canvas.configure(cursor="arrow")
 
+    def _add_selection_to_global(self):
+        """Add the currently selected highlight/redact to global overlay (all steps)."""
+        objects = step_objects.get(self.index, [])
+        if self._selected_obj is None or self._selected_obj >= len(objects):
+            return
+        obj = objects[self._selected_obj]
+        if obj["type"] not in ("highlight", "redact"):
+            _set_status("Only highlight or redact can be applied to all steps", C["muted"])
+            return
+        cx1, cy1, cx2, cy2 = self._crop_region
+        cw = max(1, cx2 - cx1)
+        ch = max(1, cy2 - cy1)
+        x1, y1, x2, y2 = _obj_bbox_img(obj)
+        global global_annotations
+        global_annotations.append({
+            "type":     obj["type"],
+            "color":    obj.get("color", "#e74c3c"),
+            "width":    obj.get("width", 3),
+            "x1_norm":  (x1 - cx1) / cw, "y1_norm": (y1 - cy1) / ch,
+            "x2_norm":  (x2 - cx1) / cw, "y2_norm": (y2 - cy1) / ch,
+        })
+        _save_global_overlay()
+        for card in step_cards:
+            if isinstance(card, StepCard) and card.canvas and hasattr(card, "_render_objects"):
+                card._render_objects()
+        _set_status("Added to all steps — appears on every screenshot", C["success"])
+
     # ── Right-click context menu on canvas objects ───────────────────────
 
     def _on_canvas_right_click(self, event):
@@ -1605,6 +1854,8 @@ class StepCard(BaseCard):
                 obj = objects[self._selected_obj]
                 label = obj["type"].capitalize()
                 menu.add_command(label=f"Delete {label}  [Del]", command=self.delete_selected)
+                if obj["type"] in ("highlight", "redact"):
+                    menu.add_command(label="Add to all steps", command=self._add_selection_to_global)
                 if obj["type"] != "redact":
                     color_sub = tk.Menu(menu, tearoff=0, bg=C["surface"], fg=C["text"],
                         activebackground=C["accent"], activeforeground="#fff",
@@ -1615,6 +1866,13 @@ class StepCard(BaseCard):
                             command=lambda c=hex_col: self.apply_color_to_selection(c))
                     menu.add_cascade(label="Colour", menu=color_sub)
                 menu.add_separator()
+        if self.index in step_crops:
+            menu.add_command(label="Apply crop (permanent)", command=self._apply_crop)
+            menu.add_command(label="Clear crop", command=self._reset_crop)
+            menu.add_separator()
+        if global_annotations:
+            menu.add_command(label="Clear all global overlays", command=_clear_global_overlays)
+            menu.add_separator()
         menu.add_command(label="Full view", command=lambda: self._show_fullscreen())
         try:
             menu.tk_popup(event.x_root, event.y_root)
@@ -1716,6 +1974,60 @@ class StepCard(BaseCard):
         self._refresh_undo_btn()
         _set_status("↺  Crop reset to original", C["success"])
 
+    def _apply_crop(self):
+        """Permanently crop the screenshot to the current crop region and clear the crop."""
+        if self.index not in step_crops or not current_session:
+            _set_status("No crop to apply on this step", C["muted"])
+            return
+        entry = log_data[self.index]
+        if not entry.get("screenshot"):
+            return
+        img_path = os.path.join(current_session, entry["screenshot"])
+        if not os.path.exists(img_path):
+            _set_status("Screenshot file missing", C["danger"])
+            return
+        try:
+            img = Image.open(img_path).convert("RGB")
+        except Exception as e:
+            _set_status(f"Could not open image: {e}", C["danger"])
+            return
+        crop = step_crops[self.index]
+        x1, y1 = crop["x1"], crop["y1"]
+        x2, y2 = crop["x2"], crop["y2"]
+        x1, x2 = sorted([x1, x2]); y1, y2 = sorted([y1, y2])
+        x1 = max(0, min(x1, img.width)); y1 = max(0, min(y1, img.height))
+        x2 = max(x1 + 1, min(x2, img.width)); y2 = max(y1 + 1, min(y2, img.height))
+        cropped = img.crop((x1, y1, x2, y2))
+        try:
+            cropped.save(img_path, "PNG" if img_path.lower().endswith(".png") else "JPEG", quality=85)
+        except OSError as e:
+            _set_status(f"Could not save: {e}", C["danger"])
+            return
+        # Translate annotations to new origin (crop becomes 0,0)
+        new_w, new_h = x2 - x1, y2 - y1
+        objs = step_objects.get(self.index, [])
+        new_objs = []
+        for obj in objs:
+            if obj["type"] in ("highlight", "redact"):
+                o1 = obj["x1"] - x1; o2 = obj["x2"] - x1
+                oy1 = obj["y1"] - y1; oy2 = obj["y2"] - y1
+                o1, o2 = sorted([o1, o2]); oy1, oy2 = sorted([oy1, oy2])
+                if o1 >= new_w or o2 <= 0 or oy1 >= new_h or oy2 <= 0:
+                    continue
+                o1 = max(0, min(o1, new_w)); o2 = max(0, min(o2, new_w))
+                oy1 = max(0, min(oy1, new_h)); oy2 = max(0, min(oy2, new_h))
+                new_objs.append({**obj, "x1": o1, "y1": oy1, "x2": o2, "y2": oy2})
+            elif obj["type"] == "draw":
+                pts = [(max(0, min(p[0] - x1, new_w)), max(0, min(p[1] - y1, new_h))) for p in obj["points"]]
+                if pts:
+                    new_objs.append({**obj, "points": pts})
+        step_objects[self.index] = new_objs
+        step_crops.pop(self.index, None)
+        save_steps()
+        self.reload_image()
+        self._refresh_undo_btn()
+        _set_status("Crop applied — image permanently resized", C["success"])
+
     def _move_up(self):
         if self.index > 0:
             _swap_steps(self.index, self.index - 1)
@@ -1813,12 +2125,10 @@ class ListCard(BaseCard):
         if entry.get("screenshot") is None:
             return
         img_path = os.path.join(current_session, entry["screenshot"])
-        if not os.path.exists(img_path):
-            return
-        img = Image.open(img_path).convert("RGB")
-        img.thumbnail((LIST_THUMB_W, 68), Image.BILINEAR)
-        self._photo = ImageTk.PhotoImage(img)
-        self._thumb_label.configure(image=self._photo)
+        img = _load_thumbnail_fast(img_path, (LIST_THUMB_W, 68))
+        if img is not None:
+            self._photo = ImageTk.PhotoImage(img)
+            self._thumb_label.configure(image=self._photo)
 
 
 # ══════════════════════════════════════ GRID CARD ══════════════════════════════════════
@@ -1887,12 +2197,10 @@ class GridCard(BaseCard):
         if entry.get("screenshot") is None:
             return
         img_path = os.path.join(current_session, entry["screenshot"])
-        if not os.path.exists(img_path):
-            return
-        img = Image.open(img_path).convert("RGB")
-        img.thumbnail((GRID_TILE_W-4, 150), Image.BILINEAR)
-        self._photo = ImageTk.PhotoImage(img)
-        self._thumb_label.configure(image=self._photo)
+        img = _load_thumbnail_fast(img_path, (GRID_TILE_W - 4, 150))
+        if img is not None:
+            self._photo = ImageTk.PhotoImage(img)
+            self._thumb_label.configure(image=self._photo)
 
 
 # ══════════════════════════════════════ CARD MANAGEMENT ══════════════════════════════════════
@@ -1900,6 +2208,7 @@ class GridCard(BaseCard):
 def _clear_cards():
     _card_drag_cleanup()
     active_card_ref[0] = None
+    _card_load_pending.clear()
     for card in step_cards:
         try: card.outer.destroy()
         except Exception: pass
@@ -1959,8 +2268,46 @@ def _build_all_cards():
     root.after(80, _lazy_load_visible_cards)
 
 
+def _drain_card_load_results():
+    """Process completed background image loads (main thread only)."""
+    applied = 0
+    while True:
+        try:
+            index, img_path, mtime, result = _card_load_result_queue.get_nowait()
+        except queue.Empty:
+            break
+        _card_load_pending.discard(index)
+        if result is None:
+            continue
+        if not step_cards or index >= len(step_cards):
+            continue
+        card = step_cards[index]
+        if not isinstance(card, StepCard) or card.index != index or card.is_text_only:
+            continue
+        if not current_session:
+            continue
+        entry = log_data[index]
+        expected_path = os.path.join(current_session, entry.get("screenshot") or "")
+        if img_path != expected_path:
+            continue
+        resized_pil, disp_size, orig_size = result
+        card._apply_loaded_image(resized_pil, disp_size, orig_size)
+        card._loaded = True
+        applied += 1
+        crop_tuple = step_crops.get(index)
+        crop_key = (crop_tuple["x1"], crop_tuple["y1"], crop_tuple["x2"], crop_tuple["y2"]) if crop_tuple else ()
+        cache_key = (img_path, mtime, crop_key)
+        if len(_CARD_IMAGE_CACHE) >= _CARD_CACHE_MAX:
+            for k in list(_CARD_IMAGE_CACHE)[: _CARD_CACHE_MAX // 2]:
+                _CARD_IMAGE_CACHE.pop(k, None)
+        _CARD_IMAGE_CACHE[cache_key] = (card._photo, disp_size, orig_size)
+    if applied:
+        root.after(30, _drain_card_load_results)
+
+
 def _lazy_load_visible_cards():
-    """Load images only for cards currently visible in the scroll viewport."""
+    """Load images only for cards currently visible in the scroll viewport (queued in background)."""
+    _drain_card_load_results()
     try:
         canvas = cards_scroll._parent_canvas
         cy = canvas.winfo_rooty()
@@ -1970,14 +2317,21 @@ def _lazy_load_visible_cards():
     for card in step_cards:
         if not isinstance(card, StepCard) or card._loaded or card.is_text_only:
             continue
+        if card.index in _card_load_pending:
+            continue
         try:
             wy = card.outer.winfo_rooty()
             wh = card.outer.winfo_height()
         except Exception:
             continue
         if wy + wh >= cy and wy <= cy + ch:
-            card._loaded = True
-            card.reload_image()
+            entry = log_data[card.index]
+            img_path = os.path.join(current_session, entry["screenshot"]) if current_session and entry.get("screenshot") else ""
+            if not img_path or not os.path.exists(img_path):
+                continue
+            _card_load_pending.add(card.index)
+            _card_load_queue.put((card.index, img_path, CARD_IMG_MAX_W))
+    root.after(50, _drain_card_load_results)
 
 
 _lazy_load_timer = [None]
@@ -2037,8 +2391,30 @@ def _renumber_and_rebuild(scroll_to=None):
 
 
 def _scroll_to_card(index):
-    if not step_cards or index >= len(step_cards): return
-    cards_scroll._parent_canvas.yview_moveto(index / max(len(step_cards), 1))
+    """Scroll the cards area so the step at index is visible (works in default, list, grid)."""
+    if not step_cards or index >= len(step_cards):
+        return
+    try:
+        canvas = cards_scroll._parent_canvas
+        canvas.update_idletasks()
+        card_w = step_cards[index].outer
+        if not card_w.winfo_exists():
+            return
+        card_y = card_w.winfo_y()
+        bbox = canvas.bbox("all")
+        if not bbox:
+            canvas.configure(scrollregion=canvas.bbox("all"))
+            bbox = canvas.bbox("all")
+        if not bbox:
+            canvas.yview_moveto(index / max(len(step_cards), 1))
+            return
+        _, _, _, content_bottom = bbox
+        content_h = content_bottom
+        # Position so the card is visible with a small margin from top (yview_moveto = fraction of document)
+        frac = max(0.0, min(1.0, (card_y - 12) / max(1, content_h)))
+        canvas.yview_moveto(frac)
+    except Exception:
+        cards_scroll._parent_canvas.yview_moveto(index / max(len(step_cards), 1))
 
 
 def _reorder_step(src, dst):
@@ -2150,13 +2526,15 @@ def _sidebar_press(event):
 
 
 def _on_sidebar_sel_change(event):
-    """Sync sidebar listbox selection → _selected, then refresh card highlights."""
+    """Sync sidebar listbox selection → _selected, then refresh card highlights and scroll to step."""
     if _sidebar_drag.get("suppress_sel"):
         return
     _selected.clear()
     for i in sidebar_list.curselection():
         _selected.add(i)
     _refresh_card_highlights()
+    if _selected:
+        root.after(10, lambda: _scroll_to_card(min(_selected)))
 
 
 def _sidebar_motion(event):
@@ -2277,6 +2655,7 @@ def _bind_card_context(card):
             _sel_anchor = idx
         _apply_sidebar_selection()
         _refresh_card_highlights()
+        root.after(10, lambda i=idx: _scroll_to_card(i))
 
     # Double-click on overview cards → open in detail view
     if isinstance(card, (ListCard, GridCard)):
@@ -2557,6 +2936,7 @@ def _set_view_mode(mode):
     # always shows the ← Back button, regardless of how we got here.
     if mode == "default" and view_mode in ("list", "grid"):
         _prev_view_mode = view_mode
+    same_mode = (mode == view_mode)
     view_mode = mode
     # Update view tab highlight states
     for btn, m in view_mode_btns:
@@ -2583,7 +2963,14 @@ def _set_view_mode(mode):
         btn_back.pack_forget()
         for btn, m in view_mode_btns:
             btn.pack(side="left", padx=(8 if m == "list" else 2, 2), pady=5)
-    _build_all_cards()
+    # Skip rebuild when re-applying same mode and card count matches (e.g. returning from
+    # recording): preserves existing cards and their undo history.
+    if same_mode and len(step_cards) == len(log_data) and step_cards:
+        _refresh_sidebar()
+        _refresh_ui_state()
+        root.after(30, _refresh_card_highlights)
+    else:
+        _build_all_cards()
 
 
 # ══════════════════════════════════════ PROJECT NAME ══════════════════════════════════════
@@ -2752,9 +3139,10 @@ def stop_recording():
 
 
 def continue_recording():
-    global recording
+    global recording, step_counter
     if not current_session:
         return
+    step_counter = len(log_data) + 1  # next step number from current count
     recording = True
     btn_start.configure(state="disabled")
     btn_stop.configure(state="normal")
@@ -2786,10 +3174,12 @@ def _do_load_recording(folder):
     for i, entry in enumerate(steps_raw):
         objs = entry.pop("objects", [])
         crop = entry.pop("crop", None)
+        _step_id(entry)  # ensure id for fold state
         log_data.append(entry)
         step_objects[i] = objs
         if crop:
             step_crops[i] = crop
+    _load_global_overlay()
 
     current_session = folder
     step_counter    = len(log_data) + 1
@@ -3904,6 +4294,11 @@ def show_recording():
     edit_panel.pack_forget()
     _update_rec_panel()
     rec_panel.pack(fill="both", expand=True)
+    # Leave fullscreen/zoomed so the tray is actually small (not fullscreen)
+    try:
+        root.state("normal")
+    except Exception:
+        pass
     sw = root.winfo_screenwidth()
     root.overrideredirect(True)
     w = 280

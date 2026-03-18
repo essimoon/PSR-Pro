@@ -1,5 +1,6 @@
 build
 dist
 recordings
-PSR Pro.spec
 __pycache__
+*.pyc
+psr_pro_settings.json
