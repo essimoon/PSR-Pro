@@ -13,13 +13,16 @@ python main.py
 
 | Action | How |
 |--------|-----|
-| **Start** | Click ▶ Start — every mouse click and keyboard shortcut is captured as a step with a screenshot |
-| **Stop** | Click ■ Stop — session is auto-saved to `recordings/<timestamp>/` |
-| **Annotate** | Select a step → choose 🔴 Highlight or ⬛ Redact → drag a box on the screenshot |
-| **Edit** | Click a step, edit the description, click 💾 Save Description |
-| **Delete** | Select a step → 🗑 Delete Step |
-| **Export** | 🌐 HTML (single portable file, dark theme) or 📄 PDF (landscape A4, cover page) |
-| **Open old session** | 📂 Open → pick any folder inside `recordings/` |
+| **Start** | ▶ Start — every mouse click is captured as a step with a screenshot (a red ring marks the click) |
+| **Stop / Pause / Tray** | `F6` / `F7` / `F8` (global hotkeys while recording) |
+| **Browse steps** | Filmstrip on the left — click, `↑`/`↓`, drag to reorder, right-click for more |
+| **Zoom / pan** | Mouse wheel zooms, drag the image (or middle mouse) pans, double-click / *Fit* resets |
+| **Annotate** | Tool rail on the left: `V` pointer · `U` highlight · `A` arrow · `T` text · `N` numbered marker · `B` pen · `M` redact · `X` pixelate · `C` crop. Colour and size appear above the image. |
+| **Numbers** | Drop numbered markers with `N` — each one gets a note field next to the description. The notes appear as a legend in HTML and PDF. |
+| **Edit text** | Type in the box under the image — saved automatically |
+| **Add steps** | `＋ Step`, paste an image/text with `Ctrl+V`, or drop files onto the window |
+| **Export** | 🌐 HTML (single portable file) or 📄 PDF |
+| **Open old session** | 📂 Open (`Ctrl+O`) or pick one from the home screen |
 
 ## Notes
 
